@@ -4,8 +4,6 @@ services:
     container_name: discord_role_bot
     restart: unless-stopped
     ports:
-      - "8000:8000" # Пробрасываем порт 8000 локально
-    environment:
-      - BOT_TOKEN=ВАШ_ТОКЕН_БОТА_ДИСКОРД
-      - GUILD_ID=123456789012345678 # ID вашего сервера
-      - API_SECRET_KEY=СУПЕР_СЕКРЕТНЫЙ_КЛЮЧ_ДЛЯ_GOOGLE_SCRIPT
+      - "8001:8000" # Пробрасываем порт 8000 локально
+    env_file:
+      - .env
