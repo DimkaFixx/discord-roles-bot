@@ -1,0 +1,22 @@
+# ОС и системные файлы
+.DS_Store
+Thumbs.db
+ehthumbs.db
+.Spotlight-V100
+.Trashes
+
+# Временные файлы и редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Логи и базы данных
+*.log
+*.sqlite
+*.sqlite3
+
+# Секретные файлы и окружение
+.env
+.env.local
