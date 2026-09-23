@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
 import discord
 from discord.ext import commands
 from fastapi import FastAPI, Header, HTTPException, status
@@ -17,7 +18,19 @@ intents.members = True  # Включите Server Members Intent в Developer Po
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-app = FastAPI(title="Discord Role Manager API")
+
+# ----------------- LIFESPAN ДЛЯ ФОНОВОГО ЗАПУСКА БОТА -----------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запускаем бота асинхронным таском при старте FastAPI
+    bot_task = asyncio.create_task(bot.start(BOT_TOKEN))
+    print("Запущен фоновый таск авторизации Discord бота...")
+    yield
+    # Отключаем бота при остановке приложения
+    await bot.close()
+    bot_task.cancel()
+
+app = FastAPI(title="Discord Role Manager API", lifespan=lifespan)
 
 # ----------------- МОДЕЛИ ДАННЫХ -----------------
 class RoleManageRequest(BaseModel):
@@ -72,7 +85,7 @@ async def manage_roles(
 
     return {"status": "success", "details": results}
 
-# ----------------- КОМАНДЫ БОТА (ДЛЯ РАСШИРЕНИЯ) -----------------
+# ----------------- СОБЫТИЯ И КОМАНДЫ -----------------
 @bot.event
 async def on_ready():
     print(f"Бот успешно запущен как: {bot.user.name} (ID: {bot.user.id})")
@@ -84,18 +97,8 @@ async def on_ready():
 
 @bot.command(name="ping")
 async def ping(ctx):
-    await ctx.send("Pong! Бот и API работают локально в Docker.")
+    await ctx.send("Pong! Бот и API работают.")
 
-# ----------------- ЗАПУСК СЕРВИСОВ -----------------
-async def main():
-    # Запускаем FastAPI внутри контейнера на 0.0.0.0:8000
-    config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, log_level="info")
-    server = uvicorn.Server(config)
-
-    await asyncio.gather(
-        bot.start(BOT_TOKEN),
-        server.serve()
-    )
-
+# ----------------- ЗАПУСК -----------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False)
