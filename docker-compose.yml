@@ -3,7 +3,6 @@ services:
     build: .
     container_name: discord_role_bot
     restart: unless-stopped
-    ports:
-      - "8001:8000" # Пробрасываем порт 8000 локально
+    network_mode: "host"
     env_file:
       - .env
