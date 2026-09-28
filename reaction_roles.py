@@ -218,7 +218,9 @@ async def _collect_emoji_keys(
         if key not in mapping:
             continue
         try:
-            async for user in reaction.users(limit=0):
+            # ВАЖНО: limit=None значит «все». limit=0 в discord.py — это ноль
+            # элементов (`while limit > 0`), то есть пустой результат.
+            async for user in reaction.users(limit=None):
                 if user.bot:
                     continue
                 result.setdefault(user.id, set()).add(key)
@@ -839,7 +841,7 @@ def setup(bot: commands.Bot) -> None:
         )
 
         if guild is None:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content="\n".join(lines) + "\n❌ Команда вне сервера."
             )
             return
@@ -924,7 +926,7 @@ def setup(bot: commands.Bot) -> None:
             "на стороне Discord, её нельзя включить кодом."
         )
 
-        await interaction.response.edit_message(content="\n".join(lines)[:1900])
+        await interaction.edit_original_response(content="\n".join(lines)[:1900])
 
     # ----------------- /REACTIONROLES_SYNC -----------------
     @bot.tree.command(
@@ -953,4 +955,115 @@ def setup(bot: commands.Bot) -> None:
         else:
             text = "ℹ️ Нечего синхронизировать: панель не создана или маппинг пуст."
 
-        await interaction.response.edit_message(content=text)
+        await interaction.edit_original_response(content=text)
+
+    # ----------------- /REACTIONROLES_DELETE -----------------
+    @bot.tree.command(
+        name="reactionroles_delete",
+        description="Полностью удалить панель и очистить настройки",
+    )
+    @app_commands.describe(
+        confirm="Обязательное подтверждение — действие необратимо",
+        delete_message="Удалить само сообщение (иначе пометить неактивным)",
+        revoke_roles="Снять управляемые роли со всех участников",
+    )
+    async def delete_panel(
+        interaction: discord.Interaction,
+        confirm: bool = False,
+        delete_message: bool = True,
+        revoke_roles: bool = False,
+    ) -> None:
+        if not await _check_moderator(interaction):
+            return
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message(
+                "❌ Команда должна выполняться на сервере.", ephemeral=True
+            )
+            return
+
+        state = load_state()
+        if not state["message_id"] and not state["roles"]:
+            await interaction.response.send_message(
+                "ℹ️ Панель и так не настроена — удалять нечего.", ephemeral=True
+            )
+            return
+
+        if not confirm:
+            await interaction.response.send_message(
+                "⚠️ Это **необратимо**: панель будет удалена, маппинг очищен.\n"
+                + (
+                    "⚠️ `revoke_roles: true` дополнительно **снимет роли у всех** "
+                    "участников.\n"
+                    if revoke_roles
+                    else ""
+                )
+                + "Повторите с `confirm: true`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        managed = _managed_role_ids(state)
+        revoked = 0
+        revoked_errors = 0
+
+        if revoke_roles and managed:
+            for member in guild.members:
+                roles = [r for r in member.roles if r.id in managed]
+                if not roles:
+                    continue
+                try:
+                    await member.remove_roles(
+                        *roles, reason="Панель ролей: удаление панели"
+                    )
+                    revoked += 1
+                    await asyncio.sleep(SYNC_DELAY)
+                except discord.Forbidden:
+                    revoked_errors += 1
+                    print(f"[PANEL] Нет прав на снятие ролей у {member.id}")
+                except discord.HTTPException as e:
+                    revoked_errors += 1
+                    print(f"[PANEL] Ошибка снятия ролей у {member.id}: {e}")
+
+        message, status = await _fetch_panel(bot, state)
+        message_note = "сообщения не было"
+        if status == "ok" and message is not None:
+            try:
+                if delete_message:
+                    await message.delete()
+                    message_note = "сообщение удалено"
+                else:
+                    await mark_panel_inactive(message, None)
+                    message_note = "сообщение помечено неактивным"
+            except discord.NotFound:
+                message_note = "сообщение уже было удалено"
+            except discord.HTTPException as e:
+                message_note = f"не удалось обработать сообщение: {e}"
+                print(f"[PANEL] Ошибка удаления панели: {e}")
+        elif status == "broken":
+            message_note = "сообщение уже было удалено"
+
+        save_state(_empty_state())
+        print(
+            f"[PANEL] Панель удалена ({message_note}); "
+            f"роли сняты у {revoked} участников, ошибок: {revoked_errors}"
+        )
+
+        lines = [
+            "✅ **Панель удалена.**",
+            f"• Сообщение: {message_note}",
+            f"• Маппинг очищен",
+        ]
+        if revoke_roles:
+            lines.append(
+                f"• Роли сняты у {revoked} участников"
+                + (f", ошибок: {revoked_errors}" if revoked_errors else "")
+            )
+        else:
+            lines.append("• Роли у участников оставлены (`revoke_roles: false`)")
+        lines.append("Создать заново: `/reactionroles_post`.")
+
+        await interaction.edit_original_response(content="\n".join(lines))
