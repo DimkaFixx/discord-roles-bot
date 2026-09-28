@@ -289,6 +289,25 @@ async def _apply_roles(
 
 
 # ----------------- СОБЫТИЯ РЕАКЦИЙ -----------------
+def check_data_path() -> tuple[bool, str]:
+    """Проверяет, что файл состояния доступен и в него можно писать."""
+    directory = os.path.dirname(DATA_PATH) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as e:
+        return False, f"не удалось создать каталог `{directory}`: {e}"
+
+    probe = os.path.join(directory, ".write_probe")
+    try:
+        with open(probe, "w", encoding="utf-8") as file:
+            file.write("ok")
+        os.remove(probe)
+    except OSError as e:
+        return False, f"каталог `{directory}` недоступен для записи: {e}"
+
+    return True, f"`{os.path.abspath(DATA_PATH)}` доступен для записи"
+
+
 async def _handle_reaction(bot, payload) -> None:
     """Один обработчик и на добавление, и на снятие реакции.
 
@@ -296,10 +315,19 @@ async def _handle_reaction(bot, payload) -> None:
     поэтому порядок доставки событий не влияет на результат. Заодно это
     корректно обрабатывает случай, когда на одну роль ведут два эмодзи —
     роль снимается, только если активных эмодзи для неё не осталось вовсе.
+
+    Молчаливых выходов почти нет: если панель не настроена, это пишется в лог.
+    Единственный немой гард — «реакция не на нашем сообщении»: он срабатывает
+    на каждую реакцию в сервере и в логе превратился бы в поток мусора.
     """
     state = load_state()
     message_id = state["message_id"]
     if not message_id or not state["roles"]:
+        print(
+            "[PANEL] Реакция проигнорирована: панель не настроена "
+            f"(message_id={message_id}, ролей в маппинге={len(state['roles'])}). "
+            "Выполните /reactionroles_add и /reactionroles_post."
+        )
         return
     if str(payload.message_id) != message_id:
         return
@@ -308,18 +336,28 @@ async def _handle_reaction(bot, payload) -> None:
 
     guild = bot.get_guild(payload.guild_id)
     if guild is None:
+        print(f"[PANEL] Реакция проигнорирована: сервер {payload.guild_id} не найден в кэше")
         return
-    if emoji_key(payload.emoji) not in state["roles"]:
+
+    key = emoji_key(payload.emoji)
+    if key not in state["roles"]:
+        print(
+            f"[PANEL] Реакция {key} на панели не привязана к роли — "
+            "добавьте её через /reactionroles_add"
+        )
         return
 
     channel = guild.get_channel(payload.channel_id)
     if channel is None:
+        print(f"[PANEL] Реакция проигнорирована: канал {payload.channel_id} не найден")
         return
 
     try:
         message = await channel.fetch_message(payload.message_id)
     except discord.NotFound:
-        print(f"[PANEL] Сообщение-панель {payload.message_id} не найдено (удалено?)")
+        print(
+            f"[PANEL] Сообщение-панель {payload.message_id} не найдено (удалено?)"
+        )
         return
     except discord.HTTPException as e:
         print(f"[PANEL] Ошибка загрузки сообщения-панели: {e}")
@@ -331,6 +369,7 @@ async def _handle_reaction(bot, payload) -> None:
                 payload.user_id
             )
         except discord.NotFound:
+            print(f"[PANEL] Участник {payload.user_id} не найден на сервере")
             return
         except discord.HTTPException as e:
             print(f"[PANEL] Не удалось получить участника {payload.user_id}: {e}")
@@ -343,10 +382,11 @@ async def _handle_reaction(bot, payload) -> None:
         managed = _managed_role_ids(state)
         added, removed = await _apply_roles(guild, member, desired, managed)
 
-        if added:
-            print(f"[PANEL] Выдано {', '.join(added)} участнику {member.id}")
-        if removed:
-            print(f"[PANEL] Снято {', '.join(removed)} у участника {member.id}")
+        print(
+            f"[PANEL] {member} нажал {key or '—'}; активные эмодзи: "
+            f"{sorted(keys) or 'нет'}; "
+            f"выдано: {', '.join(added) or '—'}; снято: {', '.join(removed) or '—'}"
+        )
 
 
 # ----------------- СИНХРОНИЗАЦИЯ -----------------
@@ -382,10 +422,15 @@ async def sync_panel(bot) -> str:
     """
     state = load_state()
     if not state["message_id"] or not state["roles"]:
+        print(
+            "[PANEL] Синхронизация пропущена: панель не настроена "
+            f"(message_id={state['message_id']}, ролей в маппинге={len(state['roles'])})"
+        )
         return "skipped"
 
     message, status = await _fetch_panel(bot, state)
     if status != "ok" or message is None:
+        print(f"[PANEL] Синхронизация невозможна, статус панели: {status}")
         return "broken" if status == "broken" else "skipped"
 
     guild = message.guild
@@ -764,6 +809,122 @@ def setup(bot: commands.Bot) -> None:
             lines.append("\n**Панель:** не создана. Выполните `/reactionroles_post`.")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ----------------- /REACTIONROLES_DOCTOR -----------------
+    @bot.tree.command(
+        name="reactionroles_doctor", description="Диагностика панели: где именно затык"
+    )
+    async def doctor(interaction: discord.Interaction) -> None:
+        if not await _check_moderator(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        lines: list[str] = []
+
+        # 1. Файл состояния
+        writable, path_note = check_data_path()
+        mark = "✅" if writable else "❌"
+        lines.append(f"{mark} **Файл состояния:** {path_note}")
+        lines.append(
+            f"{'✅' if writable else '❌'} **Содержимое:** "
+            + json.dumps(load_state(), ensure_ascii=False)[:300]
+        )
+
+        # 2. Гильдия
+        configured = bot.get_guild(GUILD_ID)
+        lines.append(
+            f"{'✅' if configured else '❌'} **GUILD_ID={GUILD_ID}:** "
+            + ("сервер найден в кэше бота" if configured else "сервер НЕ найден в кэше")
+        )
+
+        if guild is None:
+            await interaction.response.edit_message(
+                content="\n".join(lines) + "\n❌ Команда вне сервера."
+            )
+            return
+
+        state = load_state()
+
+        # 3. Иерархия ролей — самая частая причина «роль не выдаётся»
+        me = guild.me
+        if me is not None:
+            lines.append(
+                f"ℹ️ **Роль бота:** {me.top_role.name} "
+                f"(позиция {me.top_role.position})"
+            )
+        for key, role_id_str in state["roles"].items():
+            role = guild.get_role(int(role_id_str))
+            if role is None:
+                lines.append(f"❌ **Роль для {key}:** {role_id_str} не найдена на сервере")
+            elif me is None or me.top_role.position > role.position:
+                lines.append(f"✅ **Роль для {key}:** {role.mention} — иерархия в порядке")
+            else:
+                lines.append(
+                    f"❌ **Роль для {key}:** {role.mention} ВЫШЕ роли бота — "
+                    "выдача невозможна, поднимите роль бота"
+                )
+
+        # 4. Панель
+        if not state["message_id"]:
+            lines.append("❌ **Панель:** не создана. Выполните `/reactionroles_post`")
+        else:
+            channel = (
+                guild.get_channel(int(state["channel_id"]))
+                if state["channel_id"]
+                else None
+            )
+            if channel is None:
+                lines.append(
+                    f"❌ **Канал панели** `{state['channel_id']}` не найден на сервере"
+                )
+            else:
+                perms = channel.permissions_for(guild.me)
+                lines.append(
+                    f"{'✅' if perms.send_messages else '❌'} **Право Send Messages** "
+                    f"в {channel.mention}"
+                )
+                lines.append(
+                    f"{'✅' if perms.embed_links else '⚠️'} **Право Embed Links** "
+                    f"в {channel.mention}"
+                )
+                try:
+                    message = await channel.fetch_message(int(state["message_id"]))
+                except discord.NotFound:
+                    lines.append(
+                        f"❌ **Сообщение {state['message_id']} удалено.** "
+                        "Восстановить: `/reactionroles_post`"
+                    )
+                except discord.HTTPException as e:
+                    lines.append(f"❌ **Не удалось загрузить сообщение:** {e}")
+                else:
+                    total = sum(r.count for r in message.reactions)
+                    lines.append(
+                        f"✅ **Сообщение-панель:** {message.jump_url} "
+                        f"(реакций всего: {total})"
+                    )
+                    for key in state["roles"]:
+                        found = next(
+                            (r for r in message.reactions if emoji_key(r.emoji) == key),
+                            None,
+                        )
+                        lines.append(
+                            f"{'✅' if found else '⚠️'} **Эмодзи {key}:** "
+                            + (f"реакций {found.count}" if found else "реакций нет")
+                        )
+
+        # 5. Интенты
+        lines.append(
+            f"{'✅' if bot.intents.reactions else '❌'} **intent reactions** "
+            f"в коде: {bot.intents.reactions}"
+        )
+        lines.append(
+            "ℹ️ Если события реакций не приходят вовсе, проверь "
+            "**Developer Portal → Message Reactions Intent** — это настройка "
+            "на стороне Discord, её нельзя включить кодом."
+        )
+
+        await interaction.response.edit_message(content="\n".join(lines)[:1900])
 
     # ----------------- /REACTIONROLES_SYNC -----------------
     @bot.tree.command(
