@@ -83,7 +83,14 @@ def emoji_key(emoji) -> str:
 
     Ключи должны совпадать в raw-событии и в message.reactions, иначе
     маппинг молча перестанет работать.
+
+    ВАЖНО: типы на входе разные. В raw-событии `payload.emoji` — это
+    PartialEmoji, а вот у `Reaction.emoji` обычный юникод-эмодзи приходит
+    ГОЛОЙ СТРОКОЙ (discord/state.py, `get_reaction_emoji`) и атрибута
+    `.name` у неё нет.
     """
+    if isinstance(emoji, str):
+        return emoji
     emoji_id = getattr(emoji, "id", None)
     if emoji_id:
         return f"<:{emoji.name}:{emoji_id}>"
@@ -881,15 +888,20 @@ def setup(bot: commands.Bot) -> None:
                     f"❌ **Канал панели** `{state['channel_id']}` не найден на сервере"
                 )
             else:
-                perms = channel.permissions_for(guild.me)
-                lines.append(
-                    f"{'✅' if perms.send_messages else '❌'} **Право Send Messages** "
-                    f"в {channel.mention}"
-                )
-                lines.append(
-                    f"{'✅' if perms.embed_links else '⚠️'} **Право Embed Links** "
-                    f"в {channel.mention}"
-                )
+                if guild.me is None:
+                    lines.append(
+                        f"❌ **Права в {channel.mention}:** бот не участник сервера"
+                    )
+                else:
+                    perms = channel.permissions_for(guild.me)
+                    lines.append(
+                        f"{'✅' if perms.send_messages else '❌'} **Право Send Messages** "
+                        f"в {channel.mention}"
+                    )
+                    lines.append(
+                        f"{'✅' if perms.embed_links else '⚠️'} **Право Embed Links** "
+                        f"в {channel.mention}"
+                    )
                 try:
                     message = await channel.fetch_message(int(state["message_id"]))
                 except discord.NotFound:
