@@ -7,13 +7,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import GUILD_ID, START_ROLE_IDS, is_moderator
+import start_roles
+from config import GUILD_ID, is_moderator
 
 DATA_PATH = os.getenv("REACTION_ROLES_DATA_PATH", "data/reaction_roles.json")
 
 # Маркер версии модуля. Печатается при старте и виден в /doctor.
 # Нужен, чтобы отличать «баг в коде» от «контейнер собран из старого образа».
-PANEL_VERSION = "2026-09-28-r4-emoji-str+startroles-import"
+PANEL_VERSION = "2026-09-28-r5-startroles-editable"
 
 # Пауза между изменениями ролей, чтобы не упереться в rate limit на больших серверах
 SYNC_DELAY = 0.5
@@ -630,11 +631,11 @@ def setup(bot: commands.Bot) -> None:
         else:
             text = f"✅ Эмодзи {key} привязан к {role.mention}."
 
-        if role.id in START_ROLE_IDS:
+        if role.id in set(start_roles.load_roles()):
             text += (
-                "\n⚠️ Роль входит в `START_ROLE_IDS`: `/startroles` выдаст её, "
-                "а `sync_panel` снимет за отсутствие реакции. Уберите её "
-                "из `START_ROLE_IDS` в `.env`."
+                "\n⚠️ Роль входит в начальный комплект `/startroles`: команда выдаст "
+                "её, а синхронизация панели снимет за отсутствие реакции. "
+                "Уберите её из комплекта через `/startroles_remove`."
             )
 
         if not state["message_id"] or status != "ok":
@@ -817,7 +818,9 @@ def setup(bot: commands.Bot) -> None:
                 if role is None:
                     lines.append(f"• {key} → ⚠️ роль {role_id_str} не найдена")
                     continue
-                note = " ⚠️ входит в `START_ROLE_IDS`" if role.id in START_ROLE_IDS else ""
+                note = ""
+                if role.id in set(start_roles.load_roles()):
+                    note = " ⚠️ входит в начальный комплект `/startroles`"
                 lines.append(f"• {key} → {role.mention}{note}")
 
         message, status = await _fetch_panel(bot, state)

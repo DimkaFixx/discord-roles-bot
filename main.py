@@ -8,7 +8,8 @@ from pydantic import BaseModel
 import uvicorn
 
 import reaction_roles
-from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, START_ROLE_IDS, is_moderator
+import start_roles
+from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, is_moderator
 
 # ----------------- ИНИЦИАЛИЗАЦИЯ -----------------
 intents = discord.Intents.default()
@@ -20,6 +21,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Панель выдачи ролей по реакциям: команды + обработчики событий
 reaction_roles.setup(bot)
+
+# Редактируемый начальный комплект ролей для /startroles
+start_roles.setup(bot)
 
 # ----------------- LIFESPAN ДЛЯ ФОНОВОГО ЗАПУСКА БОТА -----------------
 @asynccontextmanager
@@ -117,7 +121,7 @@ async def ping(ctx):
 # ----------------- СЛЭШ-КОМАНДА /STARTROLES -----------------
 @bot.tree.command(name="startroles", description="Выдать начальный комплект ролей участнику")
 @app_commands.describe(member="Участник, которому выдаем роли")
-async def start_roles(interaction: discord.Interaction, member: discord.Member):
+async def grant_start_roles(interaction: discord.Interaction, member: discord.Member):
     # 1. Проверяем роли модератора
     if not is_moderator(interaction.user):
         await interaction.response.send_message(
@@ -131,9 +135,17 @@ async def start_roles(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("❌ Команда должна выполняться на сервере.", ephemeral=True)
         return
 
-    # 2. Собираем роли для выдачи
+    # 2. Собираем роли для выдачи (список редактируется через /startroles_add)
+    role_ids = start_roles.load_roles()
+    if not role_ids:
+        await interaction.response.send_message(
+            "⚠️ Начальный комплект пуст. Наполните его через `/startroles_add`.",
+            ephemeral=True,
+        )
+        return
+
     roles_to_add = []
-    for role_id in START_ROLE_IDS:
+    for role_id in role_ids:
         role = guild.get_role(role_id)
         if role and role not in member.roles:
             roles_to_add.append(role)
