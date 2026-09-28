@@ -11,6 +11,10 @@ from config import GUILD_ID, START_ROLE_IDS, is_moderator
 
 DATA_PATH = os.getenv("REACTION_ROLES_DATA_PATH", "data/reaction_roles.json")
 
+# Маркер версии модуля. Печатается при старте и виден в /doctor.
+# Нужен, чтобы отличать «баг в коде» от «контейнер собран из старого образа».
+PANEL_VERSION = "2026-09-28-emoji-str-fix"
+
 # Пауза между изменениями ролей, чтобы не упереться в rate limit на больших серверах
 SYNC_DELAY = 0.5
 
@@ -59,8 +63,10 @@ def load_state() -> dict:
         state["channel_id"] = str(data["channel_id"])
     roles = data.get("roles")
     if isinstance(roles, dict):
+        # Ключи нормализуем так же, как emoji_key: иначе старые записи с
+        # U+FE0F перестанут совпадать с эмодзи из реакции
         state["roles"] = {
-            str(key): str(value)
+            _normalize_unicode_emoji(str(key)): str(value)
             for key, value in roles.items()
             if str(value).isdigit()
         }
@@ -90,11 +96,21 @@ def emoji_key(emoji) -> str:
     `.name` у неё нет.
     """
     if isinstance(emoji, str):
-        return emoji
+        return _normalize_unicode_emoji(emoji)
     emoji_id = getattr(emoji, "id", None)
     if emoji_id:
         return f"<:{emoji.name}:{emoji_id}>"
-    return emoji.name
+    return _normalize_unicode_emoji(emoji.name)
+
+
+# U+FE0F — невидимый «селектор вариации». Discord и разные клиенты ставят
+# его не всегда: тот же 🍕 может прийти как с ним, так и без. Без снятия
+# ключ привязки и ключ реакции расходятся, и роль не выдаётся.
+_VARIATION_SELECTOR = "\ufe0f"
+
+
+def _normalize_unicode_emoji(text: str) -> str:
+    return text.replace(_VARIATION_SELECTOR, "")
 
 
 # Discord отдаёт кастомные эмодзи как <:name:id> и <a:name:id> (анимированные).
@@ -126,7 +142,9 @@ async def normalize_emoji_input(bot, raw: str) -> tuple[str | None, str | None]:
     if text.isascii() or len(text) > 40 or any(char.isspace() for char in text):
         return None, f"Это не эмодзи. {_EMOJI_HINT}"
 
-    return text, None
+    # Нормализуем так же, как emoji_key, иначе ключ привязки и ключ реакции
+    # разойдутся на невидимом U+FE0F
+    return _normalize_unicode_emoji(text), None
 
 
 # ----------------- ОТРИСОВКА ПАНЕЛИ -----------------
@@ -351,8 +369,9 @@ async def _handle_reaction(bot, payload) -> None:
     key = emoji_key(payload.emoji)
     if key not in state["roles"]:
         print(
-            f"[PANEL] Реакция {key} на панели не привязана к роли — "
-            "добавьте её через /reactionroles_add"
+            f"[PANEL] Реакция {key!r} на панели не привязана к роли.\n"
+            f"        В маппинге сейчас: {list(state['roles'])!r}\n"
+            f"        (repr показывает невидимые символы — так видно расхождение ключей)"
         )
         return
 
@@ -511,6 +530,8 @@ def _resolve_channel(
 
 # ----------------- SLASH-КОМАНДЫ -----------------
 def setup(bot: commands.Bot) -> None:
+    print(f"[PANEL] Версия модуля панели ролей: {PANEL_VERSION}")
+
     @bot.event
     async def on_raw_reaction_add(payload):
         await _handle_reaction(bot, payload)
@@ -829,7 +850,7 @@ def setup(bot: commands.Bot) -> None:
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
-        lines: list[str] = []
+        lines: list[str] = [f"ℹ️ **Версия модуля:** `{PANEL_VERSION}`"]
 
         # 1. Файл состояния
         writable, path_note = check_data_path()
