@@ -13,7 +13,7 @@ DATA_PATH = os.getenv("REACTION_ROLES_DATA_PATH", "data/reaction_roles.json")
 
 # Маркер версии модуля. Печатается при старте и виден в /doctor.
 # Нужен, чтобы отличать «баг в коде» от «контейнер собран из старого образа».
-PANEL_VERSION = "2026-09-28-emoji-str-fix"
+PANEL_VERSION = "2026-09-28-r4-emoji-str+startroles-import"
 
 # Пауза между изменениями ролей, чтобы не упереться в rate limit на больших серверах
 SYNC_DELAY = 0.5
@@ -1088,7 +1088,7 @@ def setup(bot: commands.Bot) -> None:
         lines = [
             "✅ **Панель удалена.**",
             f"• Сообщение: {message_note}",
-            f"• Маппинг очищен",
+            "• Маппинг очищен",
         ]
         if revoke_roles:
             lines.append(

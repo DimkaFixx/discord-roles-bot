@@ -8,7 +8,7 @@ from pydantic import BaseModel
 import uvicorn
 
 import reaction_roles
-from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, is_moderator
+from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, START_ROLE_IDS, is_moderator
 
 # ----------------- ИНИЦИАЛИЗАЦИЯ -----------------
 intents = discord.Intents.default()
