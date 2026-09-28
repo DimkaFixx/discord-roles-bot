@@ -9,11 +9,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходный код
-COPY main.py .
+# Копируем исходный код.
+# ВАЖНО: COPY . . вместе с .dockerignore — иначе .env с токеном попадёт в образ
+COPY . .
 
-# Открываем порт для FastAPI
-EXPOSE 8000
+# Открываем порт для FastAPI (совпадает с портом в CMD и network_mode: host)
+EXPOSE 8001
 
 # Запускаем бота
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]

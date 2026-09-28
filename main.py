@@ -1,5 +1,4 @@
 import asyncio
-import os
 from contextlib import asynccontextmanager
 import discord
 from discord.ext import commands
@@ -8,30 +7,19 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 import uvicorn
 
-# ----------------- КОНФИГУРАЦИЯ ИЗ ENV -----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", 0))
-API_SECRET_KEY = os.getenv("API_SECRET_KEY")
-# ----------------- НАСТРОЙКИ ИЗ ENV -----------------
-# Читаем ID через запятую из .env и преобразуем в списки int
-ALLOWED_MODERATOR_ROLE_IDS = [
-    int(r_id.strip()) 
-    for r_id in os.getenv("ALLOWED_MODERATOR_ROLE_IDS", "").split(",") 
-    if r_id.strip().isdigit()
-]
+import reaction_roles
+from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, is_moderator
 
-START_ROLE_IDS = [
-    int(r_id.strip()) 
-    for r_id in os.getenv("START_ROLE_IDS", "").split(",") 
-    if r_id.strip().isdigit()
-]
-
-# ----------------- ИНИЦИАЛИЗА -----------------
+# ----------------- ИНИЦИАЛИЗАЦИЯ -----------------
 intents = discord.Intents.default()
 intents.members = True  # Включите Server Members Intent в Developer Portal!
 intents.message_content = True
+intents.reactions = True  # Включите Message Reactions Intent в Developer Portal!
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Панель выдачи ролей по реакциям: команды + обработчики событий
+reaction_roles.setup(bot)
 
 # ----------------- LIFESPAN ДЛЯ ФОНОВОГО ЗАПУСКА БОТА -----------------
 @asynccontextmanager
@@ -115,6 +103,13 @@ async def on_ready():
     except Exception as e:
         print(f"Ошибка синхронизации команд: {e}")
 
+    # Сверяем роли участников с текущими реакциями на панели.
+    # Отдельный try: сбой панели не должен выглядеть как сбой старта бота.
+    try:
+        await reaction_roles.sync_panel(bot)
+    except Exception as e:
+        print(f"Ошибка синхронизации панели ролей: {e}")
+
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("Pong! Бот и API работают.")
@@ -124,10 +119,7 @@ async def ping(ctx):
 @app_commands.describe(member="Участник, которому выдаем роли")
 async def start_roles(interaction: discord.Interaction, member: discord.Member):
     # 1. Проверяем роли модератора
-    user_role_ids = [role.id for role in interaction.user.roles]
-    has_permission = any(role_id in user_role_ids for role_id in ALLOWED_MODERATOR_ROLE_IDS)
-
-    if not has_permission:
+    if not is_moderator(interaction.user):
         await interaction.response.send_message(
             "❌ У вас нет прав для использования этой команды.", 
             ephemeral=True

@@ -12,6 +12,12 @@ ehthumbs.db
 *.swo
 *~
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
 # Логи и базы данных
 *.log
 *.sqlite
@@ -20,3 +26,6 @@ ehthumbs.db
 # Секретные файлы и окружение
 .env
 .env.local
+
+# Данные панели ролей (reaction_roles.json)
+data/
