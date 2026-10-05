@@ -23,7 +23,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r2-modals-service-account"
+VERSION = "2026-10-05-r3-single-modal-tz-first"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,7 +43,6 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CUSTOM_START = "anketa:start"
 CUSTOM_GUEST = "anketa:guest"
 CUSTOM_CLOSE_GUEST = "anketa:close_guest"
-CUSTOM_STEP2 = "anketa:step2"
 
 TYPE_TITLES = {
     "member": "Заявка на вступление",
@@ -63,9 +62,6 @@ STATUS_LABELS = {
 
 # Кэш вариантов справочника в памяти (группа -> список {label, roles})
 _OPTIONS: dict = {}
-
-# Черновики анкеты между двумя модальными окнами: user_id -> answers
-_drafts: dict[int, dict] = {}
 
 
 def _now_msk_str() -> str:
@@ -246,8 +242,8 @@ def _value_for_header(header: str, record: dict, status: str, decided_by: str) -
         "callsign": answers.get("callsign", ""),
         "number": answers.get("number", ""),
         "rank": answers.get("rank", ""),
-        "spec": answers.get("spec", "") or "",
-        "att": answers.get("att", "") or "",
+        "spec": answers.get("spec", "") or "-",
+        "att": answers.get("att", "") or "-",
         "timezone": answers.get("tz", "") or "",
         "discord_tag": record.get("discord_tag", ""),
         "discord_id": str(record.get("user_id", "")),
@@ -473,7 +469,11 @@ class PanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(AnketaModal1())
+        await interaction.response.send_message(
+            "Выберите часовой пояс, затем нажмите «Далее».",
+            view=TimezoneView(interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(
         label="Гость",
@@ -495,17 +495,24 @@ class PanelView(discord.ui.View):
 
 
 def _build_select(
-    custom_id: str, placeholder: str, items: list, required: bool
+    custom_id: str,
+    placeholder: str,
+    items: list,
+    required: bool,
+    ensure_dash: bool = False,
 ) -> discord.ui.Select | None:
-    if not items:
-        return None
     options = [
         discord.SelectOption(
             label=(str(item.get("label", "")) or "—")[:100],
             value=str(item.get("label", ""))[:100],
         )
         for item in items
-    ][:25]
+    ]
+    if ensure_dash and not any(option.value == "-" for option in options):
+        options.append(discord.SelectOption(label="-", value="-"))
+    options = options[:25]
+    if not options:
+        return None
     return discord.ui.Select(
         custom_id=custom_id,
         placeholder=placeholder[:150],
@@ -516,9 +523,55 @@ def _build_select(
     )
 
 
-class AnketaModal1(discord.ui.Modal, title="Анкета 1/2 — контакты и звание"):
-    def __init__(self) -> None:
+class TimezoneView(discord.ui.View):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.tz: str | None = None
+
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "Это не ваша анкета.", ephemeral=True
+                )
+                return
+            self.tz = select.values[0] if select.values else None
+            await interaction.response.defer()
+
+        select = discord.ui.Select(
+            custom_id="anketa:tz-select",
+            placeholder="Выберите часовой пояс",
+            options=[
+                discord.SelectOption(label=t[:100], value=t[:100])
+                for t in TIMEZONE_OPTIONS
+            ][:25],
+            min_values=1,
+            max_values=1,
+        )
+        select.callback = callback
+        self.add_item(select)
+
+    @discord.ui.button(
+        label="Далее", style=discord.ButtonStyle.success, custom_id="anketa:tz-next"
+    )
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        if not self.tz:
+            await interaction.response.send_message(
+                "Сначала выберите часовой пояс.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(AnketaModal(self.tz))
+
+
+class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
+    def __init__(self, tz: str) -> None:
         super().__init__()
+        self.tz = tz
         options = get_options()
         self.callsign = discord.ui.TextInput(
             custom_id="anketa:callsign", required=True, max_length=100
@@ -529,10 +582,31 @@ class AnketaModal1(discord.ui.Modal, title="Анкета 1/2 — контакт�
         self.rank = _build_select(
             "anketa:rank", "Выберите звание", options.get("rank", []), required=True
         )
+        self.spec = _build_select(
+            "anketa:spec",
+            "Специализация (если есть)",
+            options.get("spec", []),
+            required=False,
+            ensure_dash=True,
+        )
+        self.att = _build_select(
+            "anketa:att",
+            "Приписка",
+            options.get("att", []),
+            required=False,
+            ensure_dash=True,
+        )
+
         self.add_item(discord.ui.Label(text="Позывной", component=self.callsign))
         self.add_item(discord.ui.Label(text="Номер", component=self.number))
         if self.rank is not None:
             self.add_item(discord.ui.Label(text="Звание", component=self.rank))
+        if self.spec is not None:
+            self.add_item(
+                discord.ui.Label(text="Специализация (если есть)", component=self.spec)
+            )
+        if self.att is not None:
+            self.add_item(discord.ui.Label(text="Приписка", component=self.att))
 
     async def on_submit(self, interaction: discord.Interaction):
         rank = (
@@ -543,85 +617,16 @@ class AnketaModal1(discord.ui.Modal, title="Анкета 1/2 — контакт�
                 "Звание не выбрано — начните анкету заново.", ephemeral=True
             )
             return
-        _drafts[interaction.user.id] = {
+        spec = self.spec.values[0] if self.spec is not None and self.spec.values else ""
+        att = self.att.values[0] if self.att is not None and self.att.values else ""
+        answers = {
             "callsign": str(self.callsign.value).strip(),
             "number": str(self.number.value).strip(),
             "rank": rank,
+            "spec": spec or "-",
+            "att": att or "-",
+            "tz": self.tz,
         }
-        await interaction.response.send_message(
-            "Шаг 1/2 заполнен. Нажмите «Продолжить», чтобы указать службу.",
-            view=Step2View(interaction.user.id),
-            ephemeral=True,
-        )
-
-
-class Step2View(discord.ui.View):
-    def __init__(self, user_id: int) -> None:
-        super().__init__(timeout=300)
-        self.user_id = user_id
-
-    @discord.ui.button(
-        label="Продолжить", style=discord.ButtonStyle.success, custom_id=CUSTOM_STEP2
-    )
-    async def cont(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "Это не ваша анкета.", ephemeral=True
-            )
-            return
-        if interaction.user.id not in _drafts:
-            await interaction.response.send_message(
-                "Черновик не найден — начните анкету заново.", ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(AnketaModal2(self.user_id))
-
-
-class AnketaModal2(discord.ui.Modal, title="Анкета 2/2 — служба"):
-    def __init__(self, user_id: int) -> None:
-        super().__init__()
-        self.user_id = user_id
-        options = get_options()
-        self.spec = _build_select(
-            "anketa:spec",
-            "Специализация (если есть)",
-            options.get("spec", []),
-            required=False,
-        )
-        self.att = _build_select(
-            "anketa:att", "Выберите приписку", options.get("att", []), required=True
-        )
-        self.tz = _build_select(
-            "anketa:tz",
-            "Выберите часовой пояс",
-            [{"label": t} for t in TIMEZONE_OPTIONS],
-            required=True,
-        )
-        if self.spec is not None:
-            self.add_item(
-                discord.ui.Label(text="Специализация (если есть)", component=self.spec)
-            )
-        if self.att is not None:
-            self.add_item(discord.ui.Label(text="Приписка", component=self.att))
-        if self.tz is not None:
-            self.add_item(discord.ui.Label(text="Часовой пояс", component=self.tz))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        answers = _drafts.pop(self.user_id, None)
-        if answers is None:
-            await interaction.response.send_message(
-                "Черновик не найден — начните анкету заново.", ephemeral=True
-            )
-            return
-        answers["spec"] = (
-            self.spec.values[0] if self.spec is not None and self.spec.values else ""
-        )
-        answers["att"] = (
-            self.att.values[0] if self.att is not None and self.att.values else ""
-        )
-        answers["tz"] = (
-            self.tz.values[0] if self.tz is not None and self.tz.values else ""
-        )
         await _create_application(interaction, "member", answers)
 
 
