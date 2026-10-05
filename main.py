@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 import discord
 from discord.ext import commands
@@ -11,6 +12,9 @@ import applications
 import reaction_roles
 import start_roles
 from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, is_moderator
+
+# Логи discord.py и наши в stdout/stderr — иначе ошибки интеракций не видны в логах
+discord.utils.setup_logging(level=logging.INFO)
 
 # ----------------- ИНИЦИАЛИЗАЦИЯ -----------------
 intents = discord.Intents.default()

@@ -23,7 +23,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r3-single-modal-tz-first"
+VERSION = "2026-10-05-r4-defer-fixes"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -463,17 +463,24 @@ class PanelView(discord.ui.View):
         custom_id=CUSTOM_START,
     )
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not get_options().get("rank"):
+        try:
+            if not get_options().get("rank"):
+                await interaction.response.send_message(
+                    "⚠️ Анкета временно недоступна: справочник не загружен.",
+                    ephemeral=True,
+                )
+                return
             await interaction.response.send_message(
-                "⚠️ Анкета временно недоступна: справочник не загружен.",
+                "Выберите часовой пояс, затем нажмите «Далее».",
+                view=TimezoneView(interaction.user.id),
                 ephemeral=True,
             )
-            return
-        await interaction.response.send_message(
-            "Выберите часовой пояс, затем нажмите «Далее».",
-            view=TimezoneView(interaction.user.id),
-            ephemeral=True,
-        )
+        except Exception as e:
+            print(f"[ANKETA] Ошибка открытия анкеты: {e!r}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Ошибка: {e}", ephemeral=True
+                )
 
     @discord.ui.button(
         label="Гость",
@@ -537,7 +544,6 @@ class TimezoneView(discord.ui.View):
                 return
             self.tz = select.values[0] if select.values else None
             await interaction.response.defer()
-
         select = discord.ui.Select(
             custom_id="anketa:tz-select",
             placeholder="Выберите часовой пояс",
@@ -565,7 +571,14 @@ class TimezoneView(discord.ui.View):
                 "Сначала выберите часовой пояс.", ephemeral=True
             )
             return
-        await interaction.response.send_modal(AnketaModal(self.tz))
+        try:
+            await interaction.response.send_modal(AnketaModal(self.tz))
+        except Exception as e:
+            print(f"[ANKETA] Ошибка открытия модалки: {e!r}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Ошибка: {e}", ephemeral=True
+                )
 
 
 class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
@@ -609,24 +622,44 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
             self.add_item(discord.ui.Label(text="Приписка", component=self.att))
 
     async def on_submit(self, interaction: discord.Interaction):
-        rank = (
-            self.rank.values[0] if self.rank is not None and self.rank.values else ""
-        )
-        if not rank:
-            await interaction.response.send_message(
-                "Звание не выбрано — начните анкету заново.", ephemeral=True
+        try:
+            rank = (
+                self.rank.values[0]
+                if self.rank is not None and self.rank.values
+                else ""
             )
+            if not rank:
+                await interaction.response.send_message(
+                    "Звание не выбрано — начните анкету заново.", ephemeral=True
+                )
+                return
+            spec = (
+                self.spec.values[0]
+                if self.spec is not None and self.spec.values
+                else ""
+            )
+            att = (
+                self.att.values[0]
+                if self.att is not None and self.att.values
+                else ""
+            )
+            answers = {
+                "callsign": str(self.callsign.value).strip(),
+                "number": str(self.number.value).strip(),
+                "rank": rank,
+                "spec": spec or "-",
+                "att": att or "-",
+                "tz": self.tz,
+            }
+        except Exception as e:
+            print(f"[ANKETA] Ошибка чтения анкеты: {e!r}")
+            try:
+                await interaction.response.send_message(
+                    f"❌ Ошибка обработки анкеты: {e}", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
             return
-        spec = self.spec.values[0] if self.spec is not None and self.spec.values else ""
-        att = self.att.values[0] if self.att is not None and self.att.values else ""
-        answers = {
-            "callsign": str(self.callsign.value).strip(),
-            "number": str(self.number.value).strip(),
-            "rank": rank,
-            "spec": spec or "-",
-            "att": att or "-",
-            "tz": self.tz,
-        }
         await _create_application(interaction, "member", answers)
 
 
@@ -764,9 +797,17 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
         )
         return
 
+    # Подтверждаем интеракцию СРАЗУ: сетевые вызовы ниже (channel.send) могут
+    # занять больше 3 секунд, из-за чего Discord показывает "не ответило вовремя".
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except discord.HTTPException as e:
+        print(f"[ANKETA] Не удалось подтвердить интеракцию: {e!r}")
+        return
+
     channel = guild.get_channel(APPLICATION_CHANNEL_ID) if APPLICATION_CHANNEL_ID else None
     if not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Канал заявок не настроен или недоступен.", ephemeral=True
         )
         return
@@ -774,7 +815,7 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
     data = load_applications()
     for record in data["pending"].values():
         if record.get("user_id") == interaction.user.id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ У вас уже есть активная заявка.", ephemeral=True
             )
             return
@@ -794,6 +835,8 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
     ping = " ".join(mentions) if mentions else ""
     content = (ping + "\n" if ping else "") + "Новая заявка на рассмотрение."
 
+    # Ловим в том числе сетевые ошибки (aiohttp), которые НЕ являются
+    # discord.HTTPException — иначе они улетают наружу и ломают ответ.
     try:
         message = await channel.send(
             content=content,
@@ -801,8 +844,9 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
             view=ApplicationView(app_id),
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
-    except discord.HTTPException as e:
-        await interaction.response.send_message(
+    except Exception as e:
+        print(f"[ANKETA] Ошибка отправки заявки в канал: {e!r}")
+        await interaction.followup.send(
             f"❌ Не удалось отправить заявку: {e}", ephemeral=True
         )
         return
@@ -812,7 +856,7 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
     data["pending"][app_id] = record
     save_applications(data)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "✅ Заявка отправлена офицерам на рассмотрение.", ephemeral=True
     )
 
