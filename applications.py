@@ -15,6 +15,7 @@ from config import (
     APPLICATION_CHANNEL_ID,
     CLOSE_GUEST_ROLE_IDS,
     GUEST_ROLE_IDS,
+    OFFICER_ROLE_IDS,
     SERVICE_ACCOUNT_FOR_SPREADSHEET_FILENAME,
     SHEET_REFERENCE,
     SHEET_RESPONSES,
@@ -23,7 +24,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r4-defer-fixes"
+VERSION = "2026-10-05-r5-fix-officer-import"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
