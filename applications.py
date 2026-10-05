@@ -3,7 +3,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -11,6 +11,7 @@ from discord.ext import commands
 
 import start_roles
 from config import (
+    ALLOWED_MODERATOR_ROLE_IDS,
     APPLICATION_CHANNEL_ID,
     CLOSE_GUEST_ROLE_IDS,
     GUEST_ROLE_IDS,
@@ -22,7 +23,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r1-service-account"
+VERSION = "2026-10-05-r2-modals-service-account"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,6 +43,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 CUSTOM_START = "anketa:start"
 CUSTOM_GUEST = "anketa:guest"
 CUSTOM_CLOSE_GUEST = "anketa:close_guest"
+CUSTOM_STEP2 = "anketa:step2"
 
 TYPE_TITLES = {
     "member": "Заявка на вступление",
@@ -61,6 +63,15 @@ STATUS_LABELS = {
 
 # Кэш вариантов справочника в памяти (группа -> список {label, roles})
 _OPTIONS: dict = {}
+
+# Черновики анкеты между двумя модальными окнами: user_id -> answers
+_drafts: dict[int, dict] = {}
+
+
+def _now_msk_str() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime(
+        "%d.%m.%Y %H:%M МСК"
+    )
 
 
 # ============================================================================
@@ -462,11 +473,7 @@ class PanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(
-            "Выберите параметры и нажмите «Далее»:",
-            view=AnketaSelectView(interaction.user.id),
-            ephemeral=True,
-        )
+        await interaction.response.send_modal(AnketaModal1())
 
     @discord.ui.button(
         label="Гость",
@@ -487,90 +494,135 @@ class PanelView(discord.ui.View):
         await _create_application(interaction, "close_guest", {})
 
 
-class AnketaSelectView(discord.ui.View):
-    def __init__(self, user_id: int) -> None:
-        super().__init__(timeout=600)
-        self.user_id = user_id
-        self.answers: dict = {}
-
-        options = get_options()
-        self._add_select(
-            "rank", "Звание", options.get("rank", []), required=True
+def _build_select(
+    custom_id: str, placeholder: str, items: list, required: bool
+) -> discord.ui.Select | None:
+    if not items:
+        return None
+    options = [
+        discord.SelectOption(
+            label=(str(item.get("label", "")) or "—")[:100],
+            value=str(item.get("label", ""))[:100],
         )
-        self._add_select(
-            "spec", "Специализация (необязательно)", options.get("spec", []), required=False
-        )
-        self._add_select(
-            "att", "Приписка", options.get("att", []), required=False
-        )
-        self._add_select(
-            "tz",
-            "Часовой пояс",
-            [{"label": t, "roles": []} for t in TIMEZONE_OPTIONS],
-            required=True,
-        )
-
-    def _add_select(self, key, placeholder, items, required) -> None:
-        if not items:
-            return
-        select_options = [
-            discord.SelectOption(
-                label=(str(item.get("label", "")) or "—")[:100],
-                value=str(item.get("label", ""))[:100],
-            )
-            for item in items
-        ][:25]
-
-        async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
-                await interaction.response.send_message(
-                    "Это не ваша анкета.", ephemeral=True
-                )
-                return
-            self.answers[key] = select.values[0] if select.values else None
-            await interaction.response.defer()
-
-        select = discord.ui.Select(
-            placeholder=placeholder,
-            options=select_options,
-            min_values=1 if required else 0,
-            max_values=1,
-            custom_id=f"anketa:sel:{key}",
-        )
-        select.callback = callback
-        self.add_item(select)
-
-    @discord.ui.button(
-        label="Далее",
-        style=discord.ButtonStyle.success,
-        custom_id="anketa:next",
+        for item in items
+    ][:25]
+    return discord.ui.Select(
+        custom_id=custom_id,
+        placeholder=placeholder[:150],
+        options=options,
+        min_values=1 if required else 0,
+        max_values=1,
+        required=required,
     )
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Это не ваша анкета.", ephemeral=True)
-            return
-        if not self.answers.get("rank"):
-            await interaction.response.send_message(
-                "Сначала выберите звание.", ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(AnketaModal(self.answers))
 
 
-class AnketaModal(discord.ui.Modal, title="Анкета — контакты"):
-    callsign = discord.ui.TextInput(
-        label="Позывной", required=True, max_length=100
-    )
-    number = discord.ui.TextInput(label="Номер", required=True, max_length=32)
-
-    def __init__(self, answers: dict) -> None:
+class AnketaModal1(discord.ui.Modal, title="Анкета 1/2 — контакты и звание"):
+    def __init__(self) -> None:
         super().__init__()
-        self.answers = answers
+        options = get_options()
+        self.callsign = discord.ui.TextInput(
+            custom_id="anketa:callsign", required=True, max_length=100
+        )
+        self.number = discord.ui.TextInput(
+            custom_id="anketa:number", required=True, max_length=32
+        )
+        self.rank = _build_select(
+            "anketa:rank", "Выберите звание", options.get("rank", []), required=True
+        )
+        self.add_item(discord.ui.Label(text="Позывной", component=self.callsign))
+        self.add_item(discord.ui.Label(text="Номер", component=self.number))
+        if self.rank is not None:
+            self.add_item(discord.ui.Label(text="Звание", component=self.rank))
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.answers["callsign"] = str(self.callsign.value).strip()
-        self.answers["number"] = str(self.number.value).strip()
-        await _create_application(interaction, "member", self.answers)
+        rank = (
+            self.rank.values[0] if self.rank is not None and self.rank.values else ""
+        )
+        if not rank:
+            await interaction.response.send_message(
+                "Звание не выбрано — начните анкету заново.", ephemeral=True
+            )
+            return
+        _drafts[interaction.user.id] = {
+            "callsign": str(self.callsign.value).strip(),
+            "number": str(self.number.value).strip(),
+            "rank": rank,
+        }
+        await interaction.response.send_message(
+            "Шаг 1/2 заполнен. Нажмите «Продолжить», чтобы указать службу.",
+            view=Step2View(interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class Step2View(discord.ui.View):
+    def __init__(self, user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    @discord.ui.button(
+        label="Продолжить", style=discord.ButtonStyle.success, custom_id=CUSTOM_STEP2
+    )
+    async def cont(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        if interaction.user.id not in _drafts:
+            await interaction.response.send_message(
+                "Черновик не найден — начните анкету заново.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(AnketaModal2(self.user_id))
+
+
+class AnketaModal2(discord.ui.Modal, title="Анкета 2/2 — служба"):
+    def __init__(self, user_id: int) -> None:
+        super().__init__()
+        self.user_id = user_id
+        options = get_options()
+        self.spec = _build_select(
+            "anketa:spec",
+            "Специализация (если есть)",
+            options.get("spec", []),
+            required=False,
+        )
+        self.att = _build_select(
+            "anketa:att", "Выберите приписку", options.get("att", []), required=True
+        )
+        self.tz = _build_select(
+            "anketa:tz",
+            "Выберите часовой пояс",
+            [{"label": t} for t in TIMEZONE_OPTIONS],
+            required=True,
+        )
+        if self.spec is not None:
+            self.add_item(
+                discord.ui.Label(text="Специализация (если есть)", component=self.spec)
+            )
+        if self.att is not None:
+            self.add_item(discord.ui.Label(text="Приписка", component=self.att))
+        if self.tz is not None:
+            self.add_item(discord.ui.Label(text="Часовой пояс", component=self.tz))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = _drafts.pop(self.user_id, None)
+        if answers is None:
+            await interaction.response.send_message(
+                "Черновик не найден — начните анкету заново.", ephemeral=True
+            )
+            return
+        answers["spec"] = (
+            self.spec.values[0] if self.spec is not None and self.spec.values else ""
+        )
+        answers["att"] = (
+            self.att.values[0] if self.att is not None and self.att.values else ""
+        )
+        answers["tz"] = (
+            self.tz.values[0] if self.tz is not None and self.tz.values else ""
+        )
+        await _create_application(interaction, "member", answers)
 
 
 # ============================================================================
@@ -686,6 +738,19 @@ class ApplicationView(discord.ui.View):
         await interaction.response.send_modal(RejectModal(self.app_id))
 
 
+def _officer_mentions(guild: discord.Guild) -> list[str]:
+    """Упоминания ролей офицеров и модераторов (без дублей)."""
+    mentions: list[str] = []
+    seen: set[int] = set()
+    for role_id in list(ALLOWED_MODERATOR_ROLE_IDS) + list(OFFICER_ROLE_IDS):
+        if role_id in seen:
+            continue
+        seen.add(role_id)
+        if guild.get_role(role_id) is not None:
+            mentions.append(f"<@&{role_id}>")
+    return mentions
+
+
 async def _create_application(interaction: discord.Interaction, type_: str, answers: dict):
     guild = interaction.guild
     if guild is None:
@@ -720,10 +785,16 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
         "status": "pending",
     }
 
+    mentions = _officer_mentions(guild)
+    ping = " ".join(mentions) if mentions else ""
+    content = (ping + "\n" if ping else "") + "Новая заявка на рассмотрение."
+
     try:
         message = await channel.send(
+            content=content,
             embed=build_application_embed(record, "pending"),
             view=ApplicationView(app_id),
+            allowed_mentions=discord.AllowedMentions(roles=True),
         )
     except discord.HTTPException as e:
         await interaction.response.send_message(
@@ -751,21 +822,70 @@ async def _fetch_message(guild: discord.Guild, channel_id: int, message_id: int)
         return None
 
 
-async def _notify_user(guild: discord.Guild, user_id: int, status: str, reason: str = ""):
+async def _notify_user(
+    guild: discord.Guild,
+    record: dict,
+    status: str,
+    reason: str = "",
+    decided_by: discord.abc.User | None = None,
+):
+    user_id = record.get("user_id")
     member = guild.get_member(user_id)
     if member is None:
         try:
             member = await guild.fetch_member(user_id)
         except discord.HTTPException:
             return
-    if status == "approved":
-        text = "✅ Ваша заявка одобрена."
-    else:
-        text = "❌ Ваша заявка отклонена."
-    if reason:
-        text += f"\nПричина: {reason}"
+
+    type_ = record.get("type", "member")
+    answers = record.get("answers", {}) or {}
+
+    embed = discord.Embed(
+        title=TYPE_TITLES.get(type_, "Заявка"),
+        color=(
+            discord.Color.green()
+            if status == "approved"
+            else discord.Color.red()
+        ),
+    )
+    embed.add_field(
+        name="Статус", value=STATUS_LABELS.get(status, status), inline=False
+    )
+
+    if type_ == "member":
+        embed.add_field(name="Звание", value=answers.get("rank") or "—", inline=True)
+        embed.add_field(
+            name="Специализация", value=answers.get("spec") or "—", inline=True
+        )
+        embed.add_field(name="Приписка", value=answers.get("att") or "—", inline=True)
+        embed.add_field(name="Часовой пояс", value=answers.get("tz") or "—", inline=True)
+
+    if status == "rejected" and reason:
+        embed.add_field(name="Причина", value=reason[:1024], inline=False)
+
+    if decided_by is not None:
+        decided = (
+            decided_by.mention
+            if isinstance(decided_by, discord.Member)
+            else str(decided_by)
+        )
+        embed.add_field(
+            name="Решение", value=f"{decided}\n{_now_msk_str()}", inline=False
+        )
+
+    # Ссылка на сайт — только для принятых заявок на вступление
+    if type_ == "member" and status == "approved":
+        embed.add_field(
+            name="Дальнейшие шаги",
+            value=(
+                "Не забудь зарегистрироваться на сайте батальона "
+                "https://327.dimkafixx.ru/"
+            ),
+            inline=False,
+        )
+
     try:
-        await member.send(text)
+        await member.send(embed=embed)
     except discord.Forbidden:
         pass
     except discord.HTTPException as e:
@@ -839,7 +959,7 @@ async def process_decision(
         except discord.HTTPException as e:
             print(f"[ANKETA] Не удалось обновить сообщение заявки: {e}")
 
-    await _notify_user(guild, user_id, status, reason)
+    await _notify_user(guild, record, status, reason, decided_by=interaction.user)
 
     record["status"] = status
     record["decided_by"] = interaction.user.id

@@ -55,9 +55,10 @@ OFFICER_ROLE_IDS = _parse_int_list(os.getenv("OFFICER_ROLE_IDS", ""))
 GUEST_ROLE_IDS = _parse_int_list(os.getenv("GUEST_ROLE_IDS", ""))
 CLOSE_GUEST_ROLE_IDS = _parse_int_list(os.getenv("CLOSE_GUEST_ROLE_IDS", ""))
 
-# Варианты часового пояса для меню анкеты
+# Варианты часового пояса для меню анкеты (по умолчанию MCK-12 … MCK+12)
 TIMEZONE_OPTIONS = _parse_str_list(os.getenv("TIMEZONE_OPTIONS", "")) or [
-    f"MCK+{offset}" for offset in range(0, 13)
+    f"MCK+{offset}" if offset >= 0 else f"MCK{offset}"
+    for offset in range(-12, 13)
 ]
 
 # ----------------- ПРОВЕРКА ПРАВ -----------------
