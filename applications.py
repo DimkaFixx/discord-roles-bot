@@ -24,7 +24,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r5-fix-officer-import"
+VERSION = "2026-10-05-r6-delete-tz-message"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -573,7 +573,7 @@ class TimezoneView(discord.ui.View):
             )
             return
         try:
-            await interaction.response.send_modal(AnketaModal(self.tz))
+            await interaction.response.send_modal(AnketaModal(self.tz, interaction))
         except Exception as e:
             print(f"[ANKETA] Ошибка открытия модалки: {e!r}")
             if not interaction.response.is_done():
@@ -583,9 +583,13 @@ class TimezoneView(discord.ui.View):
 
 
 class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
-    def __init__(self, tz: str) -> None:
+    def __init__(
+        self, tz: str, origin: discord.Interaction | None = None
+    ) -> None:
         super().__init__()
         self.tz = tz
+        # Интеракция кнопки «Далее» — чтобы после отправки удалить её ephemeral-сообщение
+        self._origin = origin
         options = get_options()
         self.callsign = discord.ui.TextInput(
             custom_id="anketa:callsign", required=True, max_length=100
@@ -661,7 +665,15 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
             except discord.HTTPException:
                 pass
             return
-        await _create_application(interaction, "member", answers)
+        ok = await _create_application(interaction, "member", answers)
+        if ok and self._origin is not None:
+            try:
+                await self._origin.delete_original_response()
+            except Exception as e:
+                print(
+                    "[ANKETA] Не удалось удалить сообщение выбора часового пояса: "
+                    f"{e!r}"
+                )
 
 
 # ============================================================================
@@ -790,13 +802,15 @@ def _officer_mentions(guild: discord.Guild) -> list[str]:
     return mentions
 
 
-async def _create_application(interaction: discord.Interaction, type_: str, answers: dict):
+async def _create_application(
+    interaction: discord.Interaction, type_: str, answers: dict
+) -> bool:
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
             "❌ Действие доступно только на сервере.", ephemeral=True
         )
-        return
+        return False
 
     # Подтверждаем интеракцию СРАЗУ: сетевые вызовы ниже (channel.send) могут
     # занять больше 3 секунд, из-за чего Discord показывает "не ответило вовремя".
@@ -804,14 +818,14 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
         await interaction.response.defer(ephemeral=True, thinking=True)
     except discord.HTTPException as e:
         print(f"[ANKETA] Не удалось подтвердить интеракцию: {e!r}")
-        return
+        return False
 
     channel = guild.get_channel(APPLICATION_CHANNEL_ID) if APPLICATION_CHANNEL_ID else None
     if not isinstance(channel, discord.TextChannel):
         await interaction.followup.send(
             "❌ Канал заявок не настроен или недоступен.", ephemeral=True
         )
-        return
+        return False
 
     data = load_applications()
     for record in data["pending"].values():
@@ -819,7 +833,7 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
             await interaction.followup.send(
                 "⚠️ У вас уже есть активная заявка.", ephemeral=True
             )
-            return
+            return False
 
     app_id = uuid.uuid4().hex[:10]
     record = {
@@ -850,7 +864,7 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
         await interaction.followup.send(
             f"❌ Не удалось отправить заявку: {e}", ephemeral=True
         )
-        return
+        return False
 
     record["message_id"] = message.id
     record["channel_id"] = channel.id
@@ -860,6 +874,7 @@ async def _create_application(interaction: discord.Interaction, type_: str, answ
     await interaction.followup.send(
         "✅ Заявка отправлена офицерам на рассмотрение.", ephemeral=True
     )
+    return True
 
 
 async def _fetch_message(guild: discord.Guild, channel_id: int, message_id: int):
