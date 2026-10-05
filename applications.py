@@ -78,11 +78,27 @@ _OPTIONS: dict = {}
 # могут выбрать одну и ту же пустую строку.
 _sheet_write_lock = threading.Lock()
 
+# Сериализует операции с заявками (создание/решение) в рамках процесса:
+# исключает дубли заявок и двойные решения при гонке.
+_applications_lock = asyncio.Lock()
+
 
 def _now_msk_str() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime(
         "%d.%m.%Y %H:%M МСК"
     )
+
+
+def _msk_str_from_iso(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M МСК")
 
 
 # ============================================================================
@@ -873,49 +889,53 @@ async def _create_application(
         )
         return False
 
-    data = load_applications()
-    for record in data["pending"].values():
-        if record.get("user_id") == interaction.user.id:
+    # Блокировка сериализует проверку дублей и запись в JSON: без неё
+    # параллельные подачи (двойной клик) могли создать две заявки и затереть
+    # файл. Проверяем только pending — после решения подать заявку можно снова.
+    async with _applications_lock:
+        data = load_applications()
+        for record in data["pending"].values():
+            if record.get("user_id") == interaction.user.id:
+                await interaction.followup.send(
+                    "⚠️ У вас уже есть активная заявка.", ephemeral=True
+                )
+                return False
+
+        app_id = uuid.uuid4().hex[:10]
+        record = {
+            "app_id": app_id,
+            "type": type_,
+            "user_id": interaction.user.id,
+            "discord_tag": str(interaction.user),
+            "answers": answers,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+        }
+
+        mentions = _officer_mentions(guild)
+        ping = " ".join(mentions) if mentions else ""
+        content = (ping + "\n" if ping else "") + "Новая заявка на рассмотрение."
+
+        # Ловим в том числе сетевые ошибки (aiohttp), которые НЕ являются
+        # discord.HTTPException — иначе они улетают наружу и ломают ответ.
+        try:
+            message = await channel.send(
+                content=content,
+                embed=build_application_embed(record, "pending"),
+                view=ApplicationView(app_id),
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+        except Exception as e:
+            print(f"[ANKETA] Ошибка отправки заявки в канал: {e!r}")
             await interaction.followup.send(
-                "⚠️ У вас уже есть активная заявка.", ephemeral=True
+                f"❌ Не удалось отправить заявку: {e}", ephemeral=True
             )
             return False
 
-    app_id = uuid.uuid4().hex[:10]
-    record = {
-        "app_id": app_id,
-        "type": type_,
-        "user_id": interaction.user.id,
-        "discord_tag": str(interaction.user),
-        "answers": answers,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "pending",
-    }
-
-    mentions = _officer_mentions(guild)
-    ping = " ".join(mentions) if mentions else ""
-    content = (ping + "\n" if ping else "") + "Новая заявка на рассмотрение."
-
-    # Ловим в том числе сетевые ошибки (aiohttp), которые НЕ являются
-    # discord.HTTPException — иначе они улетают наружу и ломают ответ.
-    try:
-        message = await channel.send(
-            content=content,
-            embed=build_application_embed(record, "pending"),
-            view=ApplicationView(app_id),
-            allowed_mentions=discord.AllowedMentions(roles=True),
-        )
-    except Exception as e:
-        print(f"[ANKETA] Ошибка отправки заявки в канал: {e!r}")
-        await interaction.followup.send(
-            f"❌ Не удалось отправить заявку: {e}", ephemeral=True
-        )
-        return False
-
-    record["message_id"] = message.id
-    record["channel_id"] = channel.id
-    data["pending"][app_id] = record
-    save_applications(data)
+        record["message_id"] = message.id
+        record["channel_id"] = channel.id
+        data["pending"][app_id] = record
+        save_applications(data)
 
     await interaction.followup.send(
         "✅ Заявка отправлена офицерам на рассмотрение.", ephemeral=True
@@ -1006,78 +1026,100 @@ async def _notify_user(
 async def process_decision(
     interaction: discord.Interaction, app_id: str, status: str, reason: str = ""
 ):
-    data = load_applications()
-    record = data["pending"].get(app_id)
-    if record is None:
-        await interaction.followup.send(
-            "⚠️ Заявка уже обработана или не найдена.", ephemeral=True
-        )
-        return
-
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("❌ Только на сервере.", ephemeral=True)
-        return
-
-    type_ = record.get("type", "member")
-    answers = record.get("answers", {}) or {}
-    user_id = record["user_id"]
-
-    added: list[discord.Role] = []
-    skipped: list[str] = []
-    notes: list[str] = []
-
-    if status == "approved":
-        member = guild.get_member(user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(user_id)
-            except discord.HTTPException:
-                member = None
-
-        if member is None:
-            notes.append("⚠️ Участник не найден на сервере — роли не выданы.")
-        else:
-            role_ids = _resolve_role_ids(type_, answers)
-            added, skipped = await _grant_roles(guild, member, role_ids)
-
-        if type_ == "member":
-            try:
-                await asyncio.to_thread(
-                    _append_application_sync, record, status, str(interaction.user)
+    async with _applications_lock:
+        data = load_applications()
+        record = data["pending"].get(app_id)
+        if record is None:
+            history_record = (data.get("history") or {}).get(app_id)
+            if history_record is not None:
+                decided_status = STATUS_LABELS.get(
+                    history_record.get("status", ""),
+                    history_record.get("status", ""),
                 )
-                notes.append("Строка добавлена в таблицу.")
-            except Exception as e:
-                notes.append(f"⚠️ Не удалось записать в таблицу: {e}")
-                print(f"[ANKETA] Ошибка записи в таблицу: {e}")
+                decider_id = history_record.get("decided_by")
+                decider = f"<@{decider_id}>" if decider_id else "неизвестно"
+                when = _msk_str_from_iso(history_record.get("decided_at"))
+                text = f"⚠️ Заявка уже обработана: {decided_status} — {decider}"
+                if when:
+                    text += f" ({when})"
+                if (
+                    history_record.get("status") == "rejected"
+                    and history_record.get("reason")
+                ):
+                    text += f"\nПричина: {history_record['reason']}"
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "⚠️ Заявка уже обработана или не найдена.", ephemeral=True
+                )
+            return
 
-    record["reason"] = reason
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("❌ Только на сервере.", ephemeral=True)
+            return
 
-    message = await _fetch_message(guild, record.get("channel_id"), record.get("message_id"))
-    if message is not None:
-        try:
-            await message.edit(
-                embed=build_application_embed(
-                    record,
-                    status,
-                    decided_by=interaction.user,
-                    added=added,
-                    skipped=skipped,
-                    reason=reason,
-                ),
-                view=None,
-            )
-        except discord.HTTPException as e:
-            print(f"[ANKETA] Не удалось обновить сообщение заявки: {e}")
+        type_ = record.get("type", "member")
+        answers = record.get("answers", {}) or {}
+        user_id = record["user_id"]
 
-    await _notify_user(guild, record, status, reason, decided_by=interaction.user)
+        added: list[discord.Role] = []
+        skipped: list[str] = []
+        notes: list[str] = []
 
-    record["status"] = status
-    record["decided_by"] = interaction.user.id
-    record["decided_at"] = datetime.now(timezone.utc).isoformat()
-    data["pending"].pop(app_id, None)
-    data["history"][app_id] = record
-    save_applications(data)
+        if status == "approved":
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.HTTPException:
+                    member = None
+
+            if member is None:
+                notes.append("⚠️ Участник не найден на сервере — роли не выданы.")
+            else:
+                role_ids = _resolve_role_ids(type_, answers)
+                added, skipped = await _grant_roles(guild, member, role_ids)
+
+            if type_ == "member":
+                try:
+                    await asyncio.to_thread(
+                        _append_application_sync, record, status, str(interaction.user)
+                    )
+                    notes.append("Строка добавлена в таблицу.")
+                except Exception as e:
+                    notes.append(f"⚠️ Не удалось записать в таблицу: {e}")
+                    print(f"[ANKETA] Ошибка записи в таблицу: {e}")
+
+        record["reason"] = reason
+
+        message = await _fetch_message(
+            guild, record.get("channel_id"), record.get("message_id")
+        )
+        if message is not None:
+            try:
+                await message.edit(
+                    embed=build_application_embed(
+                        record,
+                        status,
+                        decided_by=interaction.user,
+                        added=added,
+                        skipped=skipped,
+                        reason=reason,
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException as e:
+                print(f"[ANKETA] Не удалось обновить сообщение заявки: {e}")
+
+        await _notify_user(guild, record, status, reason, decided_by=interaction.user)
+
+        record["status"] = status
+        record["decided_by"] = interaction.user.id
+        record["decided_at"] = datetime.now(timezone.utc).isoformat()
+        data["pending"].pop(app_id, None)
+        data["history"][app_id] = record
+        save_applications(data)
 
     summary = "✅ Заявка одобрена." if status == "approved" else "❌ Заявка отклонена."
     if added:
