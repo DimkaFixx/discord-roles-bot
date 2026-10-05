@@ -24,7 +24,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r6-delete-tz-message"
+VERSION = "2026-10-05-r8-spec-att-rules"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -386,6 +386,13 @@ def _resolve_role_ids(type_: str, answers: dict) -> list[int]:
         label = answers.get(key)
         if not label:
             continue
+        # Специализация не выбрана ("-"):
+        #   • приписка указана  -> роли за spec не выдаём (только приписка);
+        #   • приписка тоже нет  -> выдаём роли строки spec "-".
+        if group == "spec" and label.strip() == "-":
+            att_label = (answers.get("att") or "").strip()
+            if att_label and att_label != "-":
+                continue
         for item in options.get(group, []):
             if item.get("label") == label:
                 ids.extend(int(r) for r in item.get("roles", []) if str(r).isdigit())
