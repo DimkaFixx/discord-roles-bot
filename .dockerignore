@@ -29,3 +29,6 @@ Thumbs.db
 
 # Логи
 *.log
+
+
+.creditials.json

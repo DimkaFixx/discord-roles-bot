@@ -29,3 +29,6 @@ venv/
 
 # Данные панели ролей (reaction_roles.json)
 data/
+
+
+.creditials.json

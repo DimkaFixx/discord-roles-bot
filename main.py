@@ -7,6 +7,7 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 import uvicorn
 
+import applications
 import reaction_roles
 import start_roles
 from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID, is_moderator
@@ -24,6 +25,9 @@ reaction_roles.setup(bot)
 
 # Редактируемый начальный комплект ролей для /startroles
 start_roles.setup(bot)
+
+# Анкета вступления + гостевые заявки с модерацией офицерами
+applications.setup(bot)
 
 # ----------------- LIFESPAN ДЛЯ ФОНОВОГО ЗАПУСКА БОТА -----------------
 @asynccontextmanager
@@ -113,6 +117,12 @@ async def on_ready():
         await reaction_roles.sync_panel(bot)
     except Exception as e:
         print(f"Ошибка синхронизации панели ролей: {e}")
+
+    # Прогреваем справочник анкеты из Google-таблицы (если настроена)
+    try:
+        await applications.warmup()
+    except Exception as e:
+        print(f"Ошибка прогрева справочника анкеты: {e}")
 
 @bot.command(name="ping")
 async def ping(ctx):

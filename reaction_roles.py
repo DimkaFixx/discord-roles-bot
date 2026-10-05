@@ -221,6 +221,20 @@ def _managed_role_ids(state: dict) -> set[int]:
     return {int(role_id_str) for role_id_str in state["roles"].values()}
 
 
+def _protected_role_ids() -> set[int]:
+    """Роли, которые панель не должна снимать: стартовые, анкеты и гостей.
+
+    Импорт локальный, чтобы не было цикла: applications импортирует start_roles
+    и config, но не reaction_roles.
+    """
+    try:
+        import applications
+
+        return applications.protected_role_ids()
+    except Exception:
+        return set(start_roles.load_roles())
+
+
 def _desired_role_ids(state: dict, emoji_keys: set[str]) -> set[int]:
     mapping = state["roles"]
     return {int(mapping[key]) for key in emoji_keys if key in mapping}
@@ -289,7 +303,9 @@ async def _apply_roles(
     to_remove = [
         role
         for role in member.roles
-        if role.id in managed_role_ids and role.id not in desired_role_ids
+        if role.id in managed_role_ids
+        and role.id not in desired_role_ids
+        and role.id not in _protected_role_ids()
     ]
 
     added: list[str] = []
@@ -631,11 +647,11 @@ def setup(bot: commands.Bot) -> None:
         else:
             text = f"✅ Эмодзи {key} привязан к {role.mention}."
 
-        if role.id in set(start_roles.load_roles()):
+        if role.id in _protected_role_ids():
             text += (
-                "\n⚠️ Роль входит в начальный комплект `/startroles`: команда выдаст "
-                "её, а синхронизация панели снимет за отсутствие реакции. "
-                "Уберите её из комплекта через `/startroles_remove`."
+                "\n⚠️ Роль защищена (входит в стартовый комплект `/startroles` "
+                "или в справочник анкеты `/anketa_list`). Панель не будет снимать "
+                "её за отсутствие реакции."
             )
 
         if not state["message_id"] or status != "ok":
