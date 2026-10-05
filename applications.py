@@ -25,7 +25,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r9-write-first-empty-row"
+VERSION = "2026-10-05-r10-skip-technical-row"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,6 +40,15 @@ STATE_PATH = os.getenv(
 )
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Сколько технических строк идёт сразу после шапки листа заявок (их пропускаем).
+# По умолчанию 1: строка 2 техническая, данные пишем начиная с 3-й.
+try:
+    RESPONSE_TECHNICAL_ROWS = max(
+        0, int(os.getenv("RESPONSE_TECHNICAL_ROWS", "1"))
+    )
+except ValueError:
+    RESPONSE_TECHNICAL_ROWS = 1
 
 # custom_id постоянных компонентов (persistent views)
 CUSTOM_START = "anketa:start"
@@ -263,11 +272,16 @@ def _value_for_header(header: str, record: dict, status: str, decided_by: str) -
 
 
 def _first_empty_row(values: list[list[str]]) -> int:
-    """Первая полностью пустая строка (начиная со 2-й). Если нет — после последней."""
-    for index in range(1, len(values)):
+    """Первая полностью пустая строка, начиная с данных.
+
+    Сразу после шапки идут технические строки (по умолчанию строка 2) — их
+    пропускаем и ищем первую пустую, начиная со строки 3.
+    """
+    start_index = 1 + RESPONSE_TECHNICAL_ROWS  # 1 — шапка, дальше технические
+    for index in range(start_index, len(values)):
         if all(not str(cell).strip() for cell in values[index]):
             return index + 1
-    return len(values) + 1
+    return max(len(values) + 1, start_index + 1)
 
 
 def _append_application_sync(record: dict, status: str, decided_by: str) -> None:
