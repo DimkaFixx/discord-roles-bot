@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -24,7 +25,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r8-spec-att-rules"
+VERSION = "2026-10-05-r9-write-first-empty-row"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -63,6 +64,10 @@ STATUS_LABELS = {
 
 # Кэш вариантов справочника в памяти (группа -> список {label, roles})
 _OPTIONS: dict = {}
+
+# Сериализует чтение+запись в таблицу: иначе два одновременных одобрения
+# могут выбрать одну и ту же пустую строку.
+_sheet_write_lock = threading.Lock()
 
 
 def _now_msk_str() -> str:
@@ -257,18 +262,38 @@ def _value_for_header(header: str, record: dict, status: str, decided_by: str) -
     return ""
 
 
+def _first_empty_row(values: list[list[str]]) -> int:
+    """Первая полностью пустая строка (начиная со 2-й). Если нет — после последней."""
+    for index in range(1, len(values)):
+        if all(not str(cell).strip() for cell in values[index]):
+            return index + 1
+    return len(values) + 1
+
+
 def _append_application_sync(record: dict, status: str, decided_by: str) -> None:
-    sh = _open_spreadsheet_sync()
-    ws = sh.worksheet(SHEET_RESPONSES)
-    values = ws.get_all_values()
-    if not values:
-        headers = list(DEFAULT_RESPONSE_HEADERS)
-        ws.append_row(headers, value_input_option="RAW")
-    else:
-        headers = [str(h).strip() for h in values[0]]
-        headers = _ensure_status_columns(ws, headers)
-    row = [_value_for_header(h, record, status, decided_by) for h in headers]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    with _sheet_write_lock:
+        sh = _open_spreadsheet_sync()
+        ws = sh.worksheet(SHEET_RESPONSES)
+        values = ws.get_all_values()
+
+        if not values:
+            headers = list(DEFAULT_RESPONSE_HEADERS)
+            ws.update(
+                values=[headers], range_name="A1", value_input_option="RAW"
+            )
+            values = [headers]
+        else:
+            headers = [str(h).strip() for h in values[0]]
+            headers = _ensure_status_columns(ws, headers)
+
+        target_row = _first_empty_row(values)
+        row = [_value_for_header(h, record, status, decided_by) for h in headers]
+        ws.update(
+            values=[row],
+            range_name=f"A{target_row}",
+            value_input_option="USER_ENTERED",
+        )
+        print(f"[ANKETA] Заявка записана в строку {target_row}")
 
 
 # ============================================================================
