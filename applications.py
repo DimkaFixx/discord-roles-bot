@@ -25,7 +25,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-05-r10-skip-technical-row"
+VERSION = "2026-10-06-r11-extra-role"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -52,16 +52,18 @@ except ValueError:
 
 # custom_id постоянных компонентов (persistent views)
 CUSTOM_START = "anketa:start"
-CUSTOM_GUEST = "anketa:guest"
-CUSTOM_CLOSE_GUEST = "anketa:close_guest"
+CUSTOM_EXTRA = "anketa:extra"
 
 TYPE_TITLES = {
     "member": "Заявка на вступление",
+    "extra": "Заявка: Дополнительная роль",
+    # Легаси-типы: новые кнопки их не создают, но старые заявки дорешаются.
     "guest": "Заявка: Гость",
     "close_guest": "Заявка: Близкий гость",
 }
 TYPE_COLORS = {
     "member": discord.Color.blurple(),
+    "extra": discord.Color.gold(),
     "guest": discord.Color.greyple(),
     "close_guest": discord.Color.dark_teal(),
 }
@@ -435,6 +437,16 @@ def _resolve_role_ids(type_: str, answers: dict) -> list[int]:
     if type_ == "close_guest":
         return list(CLOSE_GUEST_ROLE_IDS)
 
+    if type_ == "extra":
+        result: list[int] = []
+        for raw in answers.get("roles", []) or []:
+            if not str(raw).isdigit():
+                continue
+            rid = int(raw)
+            if rid not in result:
+                result.append(rid)
+        return result
+
     ids: list[int] = list(start_roles.load_roles())
     options = get_options()
     for group, key in (("rank", "rank"), ("spec", "spec"), ("att", "att")):
@@ -476,6 +488,12 @@ async def _grant_roles(
         if role is None:
             skipped.append(f"`{rid}` (не найдена)")
             continue
+        if role.is_default():
+            skipped.append("@everyone")
+            continue
+        if role.managed:
+            skipped.append(f"{role.name} (управляемая)")
+            continue
         if me is not None and me.top_role.position <= role.position:
             skipped.append(f"{role.name} (выше роли бота)")
             continue
@@ -503,7 +521,8 @@ def build_panel_embed() -> discord.Embed:
         description=(
             "Нажмите **«Заполнить анкету»**, чтобы указать звание, специализацию, "
             "приписку и контакты.\n"
-            "Кнопки **«Гость»** и **«Близкий гость»** создают заявку без формы."
+            "Кнопка **«Дополнительная роль»** позволяет запросить одну или несколько "
+            "ролей и оставить комментарий — заявку рассмотрят модераторы."
         ),
     )
     embed.set_footer(
@@ -546,22 +565,63 @@ class PanelView(discord.ui.View):
                 )
 
     @discord.ui.button(
-        label="Гость",
+        label="Дополнительная роль",
         style=discord.ButtonStyle.secondary,
-        custom_id=CUSTOM_GUEST,
+        custom_id=CUSTOM_EXTRA,
     )
-    async def guest(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _create_application(interaction, "guest", {})
+    async def extra(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(ExtraRoleModal())
+        except Exception as e:
+            print(f"[ANKETA] Ошибка открытия формы доп. роли: {e!r}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Ошибка: {e}", ephemeral=True
+                )
 
-    @discord.ui.button(
-        label="Близкий гость",
-        style=discord.ButtonStyle.secondary,
-        custom_id=CUSTOM_CLOSE_GUEST,
-    )
-    async def close_guest(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await _create_application(interaction, "close_guest", {})
+
+class ExtraRoleModal(discord.ui.Modal, title="Дополнительная роль"):
+    def __init__(self) -> None:
+        super().__init__()
+        self.roles = discord.ui.RoleSelect(
+            custom_id="anketa:extra-roles",
+            placeholder="Выберите одну или несколько ролей",
+            min_values=1,
+            max_values=10,
+            required=True,
+        )
+        self.comment = discord.ui.TextInput(
+            custom_id="anketa:extra-comment",
+            placeholder="Зачем нужна роль (необязательно)",
+            required=False,
+            max_length=1000,
+            style=discord.TextStyle.paragraph,
+        )
+        self.add_item(
+            discord.ui.Label(text="Какие роли вам нужны?", component=self.roles)
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Комментарий (необязательно)", component=self.comment
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            role_ids = [str(role.id) for role in self.roles.values]
+            comment = str(self.comment.value or "").strip()
+        except Exception as e:
+            print(f"[ANKETA] Ошибка чтения формы доп. роли: {e!r}")
+            try:
+                await interaction.response.send_message(
+                    f"❌ Ошибка обработки формы: {e}", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+            return
+        await _create_application(
+            interaction, "extra", {"roles": role_ids, "comment": comment}
+        )
 
 
 def _build_select(
@@ -773,6 +833,17 @@ def build_application_embed(
         embed.add_field(name="Приписка", value=answers.get("att") or "—", inline=True)
         embed.add_field(name="Часовой пояс", value=answers.get("tz") or "—", inline=True)
 
+    elif type_ == "extra":
+        roles = [r for r in (answers.get("roles") or []) if str(r).isdigit()]
+        embed.add_field(
+            name="Запрошенные роли",
+            value=" ".join(f"<@&{r}>" for r in roles) or "—",
+            inline=False,
+        )
+        comment = str(answers.get("comment") or "").strip()
+        if comment:
+            embed.add_field(name="Комментарий", value=comment[:1024], inline=False)
+
     embed.add_field(
         name="Статус", value=STATUS_LABELS.get(status, status), inline=False
     )
@@ -851,17 +922,23 @@ class ApplicationView(discord.ui.View):
         await interaction.response.send_modal(RejectModal(self.app_id))
 
 
-def _officer_mentions(guild: discord.Guild) -> list[str]:
-    """Упоминания ролей офицеров и модераторов (без дублей)."""
-    mentions: list[str] = []
-    seen: set[int] = set()
-    for role_id in list(ALLOWED_MODERATOR_ROLE_IDS) + list(OFFICER_ROLE_IDS):
-        if role_id in seen:
-            continue
-        seen.add(role_id)
-        if guild.get_role(role_id) is not None:
-            mentions.append(f"<@&{role_id}>")
-    return mentions
+def _ping_role_ids(guild: discord.Guild, type_: str) -> list[int]:
+    """ID ролей для пинга: для доп. роли — только модераторы, иначе модераторы + офицеры.
+
+    Возвращает только реально существующие роли, без дублей. Список используется
+    и для текста пинга, и для allowed_mentions — чтобы роли, запрошенные в заявке,
+    не получали уведомление.
+    """
+    source = (
+        list(ALLOWED_MODERATOR_ROLE_IDS)
+        if type_ == "extra"
+        else list(ALLOWED_MODERATOR_ROLE_IDS) + list(OFFICER_ROLE_IDS)
+    )
+    ids: list[int] = []
+    for role_id in source:
+        if role_id not in ids and guild.get_role(role_id) is not None:
+            ids.append(role_id)
+    return ids
 
 
 async def _create_application(
@@ -912,8 +989,8 @@ async def _create_application(
             "status": "pending",
         }
 
-        mentions = _officer_mentions(guild)
-        ping = " ".join(mentions) if mentions else ""
+        ping_ids = _ping_role_ids(guild, type_)
+        ping = " ".join(f"<@&{r}>" for r in ping_ids) if ping_ids else ""
         content = (ping + "\n" if ping else "") + "Новая заявка на рассмотрение."
 
         # Ловим в том числе сетевые ошибки (aiohttp), которые НЕ являются
@@ -923,7 +1000,9 @@ async def _create_application(
                 content=content,
                 embed=build_application_embed(record, "pending"),
                 view=ApplicationView(app_id),
-                allowed_mentions=discord.AllowedMentions(roles=True),
+                allowed_mentions=discord.AllowedMentions(
+                    roles=[discord.Object(id=r) for r in ping_ids]
+                ),
             )
         except Exception as e:
             print(f"[ANKETA] Ошибка отправки заявки в канал: {e!r}")
@@ -990,6 +1069,17 @@ async def _notify_user(
         )
         embed.add_field(name="Приписка", value=answers.get("att") or "—", inline=True)
         embed.add_field(name="Часовой пояс", value=answers.get("tz") or "—", inline=True)
+
+    elif type_ == "extra":
+        roles = [r for r in (answers.get("roles") or []) if str(r).isdigit()]
+        embed.add_field(
+            name="Запрошенные роли",
+            value=" ".join(f"<@&{r}>" for r in roles) or "—",
+            inline=False,
+        )
+        comment = str(answers.get("comment") or "").strip()
+        if comment:
+            embed.add_field(name="Комментарий", value=comment[:1024], inline=False)
 
     if status == "rejected" and reason:
         embed.add_field(name="Причина", value=reason[:1024], inline=False)
@@ -1358,16 +1448,5 @@ def setup(bot: commands.Bot) -> None:
                 f"{mark} **Канал заявок:** "
                 + (channel.mention if isinstance(channel, discord.TextChannel) else "не задан")
             )
-            for label, ids in (
-                ("Гость", GUEST_ROLE_IDS),
-                ("Близкий гость", CLOSE_GUEST_ROLE_IDS),
-            ):
-                roles = [guild.get_role(r) for r in ids]
-                ok = bool(ids) and all(r is not None for r in roles)
-                lines.append(
-                    ("✅" if ok else "⚠️")
-                    + f" **{label}:** "
-                    + (", ".join(r.mention for r in roles if r is not None) or "не заданы")
-                )
 
         await interaction.edit_original_response(content="\n".join(lines)[:1900])
