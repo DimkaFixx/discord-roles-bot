@@ -17,6 +17,7 @@ from config import (
     CLOSE_GUEST_ROLE_IDS,
     GUEST_ROLE_IDS,
     OFFICER_ROLE_IDS,
+    ONLY_MODER_DS_ID,
     SERVICE_ACCOUNT_FOR_SPREADSHEET_FILENAME,
     SHEET_REFERENCE,
     SHEET_RESPONSES,
@@ -25,7 +26,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-06-r11-extra-role"
+VERSION = "2026-10-06-r12-extra-pagination"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,6 +54,10 @@ except ValueError:
 # custom_id постоянных компонентов (persistent views)
 CUSTOM_START = "anketa:start"
 CUSTOM_EXTRA = "anketa:extra"
+
+# Постраничный выбор ролей для заявки «Дополнительная роль»
+EXTRA_PAGE_SIZE = 25
+EXTRA_MAX_ROLES = 10
 
 TYPE_TITLES = {
     "member": "Заявка на вступление",
@@ -570,8 +575,22 @@ class PanelView(discord.ui.View):
         custom_id=CUSTOM_EXTRA,
     )
     async def extra(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ Действие доступно только на сервере.", ephemeral=True
+            )
+            return
         try:
-            await interaction.response.send_modal(ExtraRoleModal())
+            view = ExtraRolesView(guild, interaction.user, interaction.user.id)
+            if not view.roles:
+                await interaction.response.send_message(
+                    "⚠️ Нет доступных ролей для запроса.", ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                view.hint(), view=view, ephemeral=True
+            )
         except Exception as e:
             print(f"[ANKETA] Ошибка открытия формы доп. роли: {e!r}")
             if not interaction.response.is_done():
@@ -580,16 +599,159 @@ class PanelView(discord.ui.View):
                 )
 
 
-class ExtraRoleModal(discord.ui.Modal, title="Дополнительная роль"):
-    def __init__(self) -> None:
-        super().__init__()
-        self.roles = discord.ui.RoleSelect(
-            custom_id="anketa:extra-roles",
-            placeholder="Выберите одну или несколько ролей",
-            min_values=1,
-            max_values=10,
-            required=True,
+class ExtraRolesView(discord.ui.View):
+    """Постраничный выбор ролей в ephemeral-сообщении.
+
+    Показывает все роли сервера (кроме @everyone, managed и уже выданных
+    участнику) по 25 на страницу. Выбор накапливается между страницами.
+    """
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        user_id: int,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.selected: set[str] = set()
+        self.page = 0
+        self.roles: list[discord.Role] = [
+            role
+            for role in guild.roles
+            if not role.is_default() and not role.managed and role not in member.roles
+        ]
+        self.roles.sort(key=lambda role: role.position, reverse=True)
+        self.max_pages = max(
+            1, (len(self.roles) + EXTRA_PAGE_SIZE - 1) // EXTRA_PAGE_SIZE
         )
+        self._rebuild()
+
+    def _page_roles(self) -> list[discord.Role]:
+        start = self.page * EXTRA_PAGE_SIZE
+        return self.roles[start : start + EXTRA_PAGE_SIZE]
+
+    def _ordered_selected(self) -> list[str]:
+        return [str(role.id) for role in self.roles if str(role.id) in self.selected]
+
+    def hint(self) -> str:
+        text = (
+            "Выберите одну или несколько ролей и нажмите **«Готово»**.\n"
+            f"Выбрано: **{len(self.selected)}**/{EXTRA_MAX_ROLES} · "
+            f"Страница {self.page + 1}/{self.max_pages}"
+        )
+        names = [role.name for role in self.roles if str(role.id) in self.selected]
+        if names:
+            shown = ", ".join(names[:15])
+            if len(names) > 15:
+                shown += "…"
+            text += f"\n**Список:** {shown}"
+        return text
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        page_roles = self._page_roles()
+        options = [
+            discord.SelectOption(
+                label=role.name[:100],
+                value=str(role.id),
+                default=str(role.id) in self.selected,
+            )
+            for role in page_roles
+        ]
+        select = discord.ui.Select(
+            custom_id="anketa:extra-select",
+            placeholder=f"Роли (страница {self.page + 1}/{self.max_pages})",
+            options=options,
+            min_values=0,
+            max_values=max(1, min(len(options), EXTRA_MAX_ROLES)),
+        )
+        select.callback = self._on_select
+        self.select = select
+        self.add_item(select)
+
+        prev = discord.ui.Button(
+            label="◀",
+            style=discord.ButtonStyle.secondary,
+            custom_id="anketa:extra-prev",
+            disabled=self.page <= 0,
+        )
+        nxt = discord.ui.Button(
+            label="▶",
+            style=discord.ButtonStyle.secondary,
+            custom_id="anketa:extra-next",
+            disabled=self.page >= self.max_pages - 1,
+        )
+        done = discord.ui.Button(
+            label="Готово",
+            style=discord.ButtonStyle.success,
+            custom_id="anketa:extra-done",
+        )
+        prev.callback = self._on_prev
+        nxt.callback = self._on_next
+        done.callback = self._on_done
+        self.add_item(prev)
+        self.add_item(nxt)
+        self.add_item(done)
+
+    def _is_owner(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
+            return
+        page_ids = {str(role.id) for role in self._page_roles()}
+        updated = (self.selected - page_ids) | set(self.select.values or [])
+        if len(updated) > EXTRA_MAX_ROLES:
+            self._rebuild()
+            await interaction.response.edit_message(content=self.hint(), view=self)
+            await interaction.followup.send(
+                f"⚠️ Можно выбрать не более {EXTRA_MAX_ROLES} ролей.", ephemeral=True
+            )
+            return
+        self.selected = updated
+        await interaction.response.defer()
+
+    async def _on_page(self, interaction: discord.Interaction, delta: int):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
+            return
+        self.page = max(0, min(self.max_pages - 1, self.page + delta))
+        self._rebuild()
+        await interaction.response.edit_message(content=self.hint(), view=self)
+
+    async def _on_prev(self, interaction: discord.Interaction):
+        await self._on_page(interaction, -1)
+
+    async def _on_next(self, interaction: discord.Interaction):
+        await self._on_page(interaction, 1)
+
+    async def _on_done(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
+            return
+        if not self.selected:
+            await interaction.response.send_message(
+                "Сначала выберите хотя бы одну роль.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            ExtraCommentModal(self._ordered_selected(), self.user_id)
+        )
+
+
+class ExtraCommentModal(discord.ui.Modal, title="Дополнительная роль"):
+    def __init__(self, role_ids: list[str], user_id: int) -> None:
+        super().__init__()
+        self.role_ids = role_ids
+        self.user_id = user_id
         self.comment = discord.ui.TextInput(
             custom_id="anketa:extra-comment",
             placeholder="Зачем нужна роль (необязательно)",
@@ -598,29 +760,20 @@ class ExtraRoleModal(discord.ui.Modal, title="Дополнительная ро�
             style=discord.TextStyle.paragraph,
         )
         self.add_item(
-            discord.ui.Label(text="Какие роли вам нужны?", component=self.roles)
-        )
-        self.add_item(
             discord.ui.Label(
                 text="Комментарий (необязательно)", component=self.comment
             )
         )
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            role_ids = [str(role.id) for role in self.roles.values]
-            comment = str(self.comment.value or "").strip()
-        except Exception as e:
-            print(f"[ANKETA] Ошибка чтения формы доп. роли: {e!r}")
-            try:
-                await interaction.response.send_message(
-                    f"❌ Ошибка обработки формы: {e}", ephemeral=True
-                )
-            except discord.HTTPException:
-                pass
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
             return
+        comment = str(self.comment.value or "").strip()
         await _create_application(
-            interaction, "extra", {"roles": role_ids, "comment": comment}
+            interaction, "extra", {"roles": self.role_ids, "comment": comment}
         )
 
 
@@ -923,17 +1076,21 @@ class ApplicationView(discord.ui.View):
 
 
 def _ping_role_ids(guild: discord.Guild, type_: str) -> list[int]:
-    """ID ролей для пинга: для доп. роли — только модераторы, иначе модераторы + офицеры.
+    """ID ролей для пинга: для доп. роли — ONLY_MODER_DS_ID (или модераторы), иначе модераторы + офицеры.
 
     Возвращает только реально существующие роли, без дублей. Список используется
     и для текста пинга, и для allowed_mentions — чтобы роли, запрошенные в заявке,
     не получали уведомление.
     """
-    source = (
-        list(ALLOWED_MODERATOR_ROLE_IDS)
-        if type_ == "extra"
-        else list(ALLOWED_MODERATOR_ROLE_IDS) + list(OFFICER_ROLE_IDS)
-    )
+    if type_ == "extra":
+        source = (
+            [ONLY_MODER_DS_ID]
+            if ONLY_MODER_DS_ID
+            else list(ALLOWED_MODERATOR_ROLE_IDS)
+        )
+    else:
+        source = list(ALLOWED_MODERATOR_ROLE_IDS) + list(OFFICER_ROLE_IDS)
+
     ids: list[int] = []
     for role_id in source:
         if role_id not in ids and guild.get_role(role_id) is not None:
@@ -1448,5 +1605,19 @@ def setup(bot: commands.Bot) -> None:
                 f"{mark} **Канал заявок:** "
                 + (channel.mention if isinstance(channel, discord.TextChannel) else "не задан")
             )
+            extra_ping = guild.get_role(ONLY_MODER_DS_ID) if ONLY_MODER_DS_ID else None
+            if extra_ping is not None:
+                lines.append(
+                    f"✅ **Пинг доп. роли:** {extra_ping.mention}"
+                )
+            elif ONLY_MODER_DS_ID:
+                lines.append(
+                    f"⚠️ **Пинг доп. роли:** роль `{ONLY_MODER_DS_ID}` не найдена, "
+                    "пингую модераторов"
+                )
+            else:
+                lines.append(
+                    "⚠️ **Пинг доп. роли:** `ONLY_MODER_DS_ID` не задан — пингую модераторов"
+                )
 
         await interaction.edit_original_response(content="\n".join(lines)[:1900])
