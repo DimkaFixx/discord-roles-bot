@@ -26,7 +26,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-06-r12-extra-pagination"
+VERSION = "2026-10-06-r13-remove-guest-on-join"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -515,6 +515,28 @@ async def _grant_roles(
     return to_add, skipped
 
 
+async def _remove_roles(
+    guild: discord.Guild,
+    member: discord.Member,
+    role_ids: list[int],
+    reason: str = "Анкета: снятие роли",
+) -> list[discord.Role]:
+    """Снимает у участника указанные роли (если они у него есть)."""
+    to_remove: list[discord.Role] = []
+    for rid in role_ids:
+        role = guild.get_role(rid)
+        if role is not None and role in member.roles:
+            to_remove.append(role)
+    if not to_remove:
+        return []
+    try:
+        await member.remove_roles(*to_remove, reason=reason)
+    except discord.HTTPException as e:
+        print(f"[ANKETA] Не удалось снять роли: {e!r}")
+        return []
+    return to_remove
+
+
 # ============================================================================
 # UI: ПАНЕЛЬ
 # ============================================================================
@@ -582,7 +604,9 @@ class PanelView(discord.ui.View):
             )
             return
         try:
-            view = ExtraRolesView(guild, interaction.user, interaction.user.id)
+            view = ExtraRolesView(
+                guild, interaction.user, interaction.user.id, interaction
+            )
             if not view.roles:
                 await interaction.response.send_message(
                     "⚠️ Нет доступных ролей для запроса.", ephemeral=True
@@ -611,9 +635,12 @@ class ExtraRolesView(discord.ui.View):
         guild: discord.Guild,
         member: discord.Member,
         user_id: int,
+        origin: discord.Interaction | None = None,
     ) -> None:
         super().__init__(timeout=600)
         self.user_id = user_id
+        # Интеракция кнопки панели, чей original response — это сообщение выбора ролей
+        self._origin = origin
         self.selected: set[str] = set()
         self.page = 0
         self.roles: list[discord.Role] = [
@@ -743,15 +770,23 @@ class ExtraRolesView(discord.ui.View):
             )
             return
         await interaction.response.send_modal(
-            ExtraCommentModal(self._ordered_selected(), self.user_id)
+            ExtraCommentModal(self._ordered_selected(), self.user_id, self._origin)
         )
 
 
 class ExtraCommentModal(discord.ui.Modal, title="Дополнительная роль"):
-    def __init__(self, role_ids: list[str], user_id: int) -> None:
+    def __init__(
+        self,
+        role_ids: list[str],
+        user_id: int,
+        origin: discord.Interaction | None = None,
+    ) -> None:
         super().__init__()
         self.role_ids = role_ids
         self.user_id = user_id
+        # Интеракция кнопки «Дополнительная роль»: её original response —
+        # ephemeral-сообщение выбора ролей, которое удаляем после отправки заявки
+        self._origin = origin
         self.comment = discord.ui.TextInput(
             custom_id="anketa:extra-comment",
             placeholder="Зачем нужна роль (необязательно)",
@@ -772,9 +807,17 @@ class ExtraCommentModal(discord.ui.Modal, title="Дополнительная р
             )
             return
         comment = str(self.comment.value or "").strip()
-        await _create_application(
+        ok = await _create_application(
             interaction, "extra", {"roles": self.role_ids, "comment": comment}
         )
+        if ok and self._origin is not None:
+            try:
+                await self._origin.delete_original_response()
+            except Exception as e:
+                print(
+                    "[ANKETA] Не удалось удалить сообщение выбора ролей: "
+                    f"{e!r}"
+                )
 
 
 def _build_select(
@@ -1327,6 +1370,18 @@ async def process_decision(
             else:
                 role_ids = _resolve_role_ids(type_, answers)
                 added, skipped = await _grant_roles(guild, member, role_ids)
+                if type_ == "member":
+                    removed_guest = await _remove_roles(
+                        guild,
+                        member,
+                        GUEST_ROLE_IDS,
+                        reason="Анкета: вступление принято — снятие гостевой роли",
+                    )
+                    if removed_guest:
+                        notes.append(
+                            "Сняты роли: "
+                            + ", ".join(r.mention for r in removed_guest)
+                        )
 
             if type_ == "member":
                 try:
