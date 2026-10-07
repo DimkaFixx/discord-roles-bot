@@ -6,6 +6,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -23,10 +24,11 @@ from config import (
     SHEET_RESPONSES,
     SPREADSHEET_ID,
     TIMEZONE_OPTIONS,
+    TOKEN_SECRET,
     is_officer,
 )
 
-VERSION = "2026-10-06-r13-remove-guest-on-join"
+VERSION = "2026-10-07-r14-sync-api-on-join-approve"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,6 +60,10 @@ CUSTOM_EXTRA = "anketa:extra"
 # Постраничный выбор ролей для заявки «Дополнительная роль»
 EXTRA_PAGE_SIZE = 25
 EXTRA_MAX_ROLES = 10
+
+# Системный API: вызывается после одобрения заявки на вступление (type_ == "member")
+SYNC_API_URL = os.getenv("SYNC_API_URL", "https://327.dimkafixx.ru/api/system/sync")
+SYNC_API_TIMEOUT = 10
 
 TYPE_TITLES = {
     "member": "Заявка на вступление",
@@ -1374,6 +1380,28 @@ async def _notify_user(
         print(f"[ANKETA] Не удалось отправить DM {user_id}: {e}")
 
 
+async def _trigger_system_sync() -> str:
+    """Вызывает системный API синхронизации после одобрения вступления.
+
+    Возвращает заметку для отчёта офицеру. Ошибки не пробрасываются: решение
+    по заявке уже зафиксировано и не должно откатываться из-за сбоя API.
+    """
+    if not TOKEN_SECRET:
+        return "⚠️ TOKEN_SECRET не задан — синхронизация не вызвана."
+    try:
+        timeout = aiohttp.ClientTimeout(total=SYNC_API_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                SYNC_API_URL, headers={"X-Token-Secret": TOKEN_SECRET}
+            ) as response:
+                if response.status < 400:
+                    return "Синхронизация запущена."
+                return f"⚠️ Синхронизация вернула статус {response.status}."
+    except Exception as e:
+        print(f"[ANKETA] Ошибка вызова системного API синхронизации: {e!r}")
+        return f"⚠️ Не удалось вызвать синхронизацию: {e}"
+
+
 async def process_decision(
     interaction: discord.Interaction, app_id: str, status: str, reason: str = ""
 ):
@@ -1483,6 +1511,10 @@ async def process_decision(
         data["pending"].pop(app_id, None)
         data["history"][app_id] = record
         save_applications(data)
+
+    # После одобрения заявки на вступление дёргаем системный API синхронизации.
+    if status == "approved" and type_ == "member":
+        notes.append(await _trigger_system_sync())
 
     summary = "✅ Заявка одобрена." if status == "approved" else "❌ Заявка отклонена."
     if added:

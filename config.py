@@ -7,6 +7,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", 0))
 API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 
+# Секрет для вызова системного API (синхронизация после одобрения вступления)
+TOKEN_SECRET = os.getenv("TOKEN_SECRET")
+
 
 def _parse_int_list(raw: str) -> list[int]:
     # Некорректные ID молча отбрасываются, а не роняют старт процесса
