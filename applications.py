@@ -607,7 +607,7 @@ class PanelView(discord.ui.View):
             view = ExtraRolesView(
                 guild, interaction.user, interaction.user.id, interaction
             )
-            if not view.roles:
+            if not view.all_roles:
                 await interaction.response.send_message(
                     "⚠️ Нет доступных ролей для запроса.", ephemeral=True
                 )
@@ -643,15 +643,28 @@ class ExtraRolesView(discord.ui.View):
         self._origin = origin
         self.selected: set[str] = set()
         self.page = 0
-        self.roles: list[discord.Role] = [
+        self.query: str = ""
+        self.all_roles: list[discord.Role] = [
             role
             for role in guild.roles
             if not role.is_default() and not role.managed and role not in member.roles
         ]
-        self.roles.sort(key=lambda role: role.position, reverse=True)
+        self.all_roles.sort(key=lambda role: role.position, reverse=True)
+        self.roles: list[discord.Role] = self.all_roles
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        query = self.query.strip().lower()
+        if query:
+            self.roles = [
+                role for role in self.all_roles if query in role.name.lower()
+            ]
+        else:
+            self.roles = self.all_roles
         self.max_pages = max(
             1, (len(self.roles) + EXTRA_PAGE_SIZE - 1) // EXTRA_PAGE_SIZE
         )
+        self.page = 0
         self._rebuild()
 
     def _page_roles(self) -> list[discord.Role]:
@@ -659,15 +672,17 @@ class ExtraRolesView(discord.ui.View):
         return self.roles[start : start + EXTRA_PAGE_SIZE]
 
     def _ordered_selected(self) -> list[str]:
-        return [str(role.id) for role in self.roles if str(role.id) in self.selected]
+        return [str(role.id) for role in self.all_roles if str(role.id) in self.selected]
 
     def hint(self) -> str:
-        text = (
-            "Выберите одну или несколько ролей и нажмите **«Готово»**.\n"
+        text = "Выберите одну или несколько ролей и нажмите **«Готово»**.\n"
+        if self.query:
+            text += f"**Поиск:** «{self.query}» · найдено {len(self.roles)}\n"
+        text += (
             f"Выбрано: **{len(self.selected)}**/{EXTRA_MAX_ROLES} · "
             f"Страница {self.page + 1}/{self.max_pages}"
         )
-        names = [role.name for role in self.roles if str(role.id) in self.selected]
+        names = [role.name for role in self.all_roles if str(role.id) in self.selected]
         if names:
             shown = ", ".join(names[:15])
             if len(names) > 15:
@@ -686,16 +701,27 @@ class ExtraRolesView(discord.ui.View):
             )
             for role in page_roles
         ]
-        select = discord.ui.Select(
-            custom_id="anketa:extra-select",
-            placeholder=f"Роли (страница {self.page + 1}/{self.max_pages})",
-            options=options,
-            min_values=0,
-            max_values=max(1, min(len(options), EXTRA_MAX_ROLES)),
+        if options:
+            select = discord.ui.Select(
+                custom_id="anketa:extra-select",
+                placeholder=f"Роли (страница {self.page + 1}/{self.max_pages})",
+                options=options,
+                min_values=0,
+                max_values=max(1, min(len(options), EXTRA_MAX_ROLES)),
+            )
+            select.callback = self._on_select
+            self.select = select
+            self.add_item(select)
+        else:
+            self.select = None
+
+        search = discord.ui.Button(
+            label="Поиск",
+            style=discord.ButtonStyle.primary,
+            custom_id="anketa:extra-search",
         )
-        select.callback = self._on_select
-        self.select = select
-        self.add_item(select)
+        search.callback = self._on_search
+        self.add_item(search)
 
         prev = discord.ui.Button(
             label="◀",
@@ -758,6 +784,14 @@ class ExtraRolesView(discord.ui.View):
     async def _on_next(self, interaction: discord.Interaction):
         await self._on_page(interaction, 1)
 
+    async def _on_search(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(ExtraSearchModal(self))
+
     async def _on_done(self, interaction: discord.Interaction):
         if not self._is_owner(interaction):
             await interaction.response.send_message(
@@ -771,6 +805,33 @@ class ExtraRolesView(discord.ui.View):
             return
         await interaction.response.send_modal(
             ExtraCommentModal(self._ordered_selected(), self.user_id, self._origin)
+        )
+
+
+class ExtraSearchModal(discord.ui.Modal, title="Поиск роли"):
+    def __init__(self, view: "ExtraRolesView") -> None:
+        super().__init__()
+        self._view = view
+        self.query = discord.ui.TextInput(
+            custom_id="anketa:extra-search-query",
+            placeholder="Часть названия роли (пусто — показать все)",
+            required=False,
+            max_length=100,
+        )
+        self.add_item(
+            discord.ui.Label(text="Поиск по названию", component=self.query)
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self._view.user_id:
+            await interaction.response.send_message(
+                "Это не ваша заявка.", ephemeral=True
+            )
+            return
+        self._view.query = str(self.query.value or "").strip()
+        self._view._apply_filter()
+        await interaction.response.edit_message(
+            content=self._view.hint(), view=self._view
         )
 
 
