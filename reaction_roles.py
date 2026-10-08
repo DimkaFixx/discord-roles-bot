@@ -7,27 +7,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import start_roles
-from config import GUILD_ID, is_moderator
+import applications
+from config import GUILD_ID, is_moderator, is_officer
 
 DATA_PATH = os.getenv("REACTION_ROLES_DATA_PATH", "data/reaction_roles.json")
 
+# Путь к состоянию старой (отдельной) панели анкеты — для одноразовой миграции.
+LEGACY_ANKETA_STATE_PATH = os.getenv(
+    "ANKETA_STATE_PATH", os.path.join("data", "anketa_state.json")
+)
+
 # Маркер версии модуля. Печатается при старте и виден в /doctor.
 # Нужен, чтобы отличать «баг в коде» от «контейнер собран из старого образа».
-PANEL_VERSION = "2026-09-28-r5-startroles-editable"
+PANEL_VERSION = "2026-10-08-r6-merged-anketa-panel"
 
 # Пауза между изменениями ролей, чтобы не упереться в rate limit на больших серверах
 SYNC_DELAY = 0.5
 
 # Лимит Discord на количество embed-полей
 MAX_PANEL_FIELDS = 25
-
-PANEL_TITLE = "Выбор ролей"
-PANEL_DESCRIPTION = (
-    "Нажмите на реакцию под ролью, чтобы её получить.\n"
-    "Уберите реакцию — роль снимется."
-)
-PANEL_FOOTER = "Роли выдаются автоматически"
 
 # Блокировки на пользователя: без них быстрый спам реакцией даёт
 # конкурентные add_roles/remove_roles по одному участнику
@@ -150,16 +148,16 @@ async def normalize_emoji_input(bot, raw: str) -> tuple[str | None, str | None]:
 
 # ----------------- ОТРИСОВКА ПАНЕЛИ -----------------
 def build_panel_embed(guild: discord.Guild, state: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title=PANEL_TITLE,
-        description=PANEL_DESCRIPTION,
-        color=discord.Color.blurple(),
-    )
+    """Объединённая панель: описание кнопок анкеты + роли из маппинга.
+
+    Текст (заголовок/описание/футер) берём из анкеты, чтобы правки делались
+    в одном месте; роли автоматически досыпаются полями.
+    """
+    embed = applications.build_panel_embed()
     for key, role_id_str in state["roles"].items():
         role = guild.get_role(int(role_id_str))
         value = role.mention if role is not None else "⚠️ роль не найдена на сервере"
         embed.add_field(name=f"{key} Роль", value=value, inline=True)
-    embed.set_footer(text=PANEL_FOOTER)
     return embed
 
 
@@ -186,10 +184,9 @@ async def render_panel(message: discord.Message, state: dict) -> None:
     """Обновляет текст панели и досыпает недостающие реакции.
 
     Реакции живут на сообщении, а message.edit() их не трогает —
-    поэтому правка маппинга безопасна для уже выданных ролей.
+    поэтому правка маппинга безопасна для уже выданных ролей. Панель
+    рендерится даже без привязок: кнопки анкеты должны работать всегда.
     """
-    if not state["roles"]:
-        return
     await message.edit(embed=build_panel_embed(message.guild, state))
     await ensure_reactions(message, state)
 
@@ -203,7 +200,8 @@ def panel_matches(message: discord.Message, state: dict) -> bool:
     if not message.embeds:
         return False
     embed = message.embeds[0]
-    if embed.title != PANEL_TITLE or embed.description != PANEL_DESCRIPTION:
+    base = applications.build_panel_embed()
+    if embed.title != base.title or embed.description != base.description:
         return False
     expected = [f"{key} Роль" for key in state["roles"]]
     return [field.name for field in embed.fields] == expected
@@ -211,7 +209,7 @@ def panel_matches(message: discord.Message, state: dict) -> bool:
 
 async def mark_panel_inactive(message: discord.Message, new_panel_url: str) -> None:
     try:
-        await message.edit(embed=build_inactive_embed(new_panel_url))
+        await message.edit(embed=build_inactive_embed(new_panel_url), view=None)
     except discord.HTTPException as e:
         print(f"[PANEL] Не удалось пометить старую панель неактивной: {e}")
 
@@ -222,17 +220,11 @@ def _managed_role_ids(state: dict) -> set[int]:
 
 
 def _protected_role_ids() -> set[int]:
-    """Роли, которые панель не должна снимать: стартовые, анкеты и гостей.
-
-    Импорт локальный, чтобы не было цикла: applications импортирует start_roles
-    и config, но не reaction_roles.
-    """
+    """Роли, которые панель не должна снимать: стартовые, анкеты и гостей."""
     try:
-        import applications
-
         return applications.protected_role_ids()
     except Exception:
-        return set(start_roles.load_roles())
+        return set()
 
 
 def _desired_role_ids(state: dict, emoji_keys: set[str]) -> set[int]:
@@ -370,7 +362,7 @@ async def _handle_reaction(bot, payload) -> None:
         print(
             "[PANEL] Реакция проигнорирована: панель не настроена "
             f"(message_id={message_id}, ролей в маппинге={len(state['roles'])}). "
-            "Выполните /reactionroles_add и /reactionroles_post."
+            "Выполните /reactionroles_add и /anketa_post."
         )
         return
     if str(payload.message_id) != message_id:
@@ -532,6 +524,49 @@ async def _check_moderator(interaction: discord.Interaction) -> bool:
     return False
 
 
+async def _check_officer(interaction: discord.Interaction) -> bool:
+    if is_officer(interaction.user):
+        return True
+    await interaction.response.send_message(
+        "❌ У вас нет прав для использования этой команды.",
+        ephemeral=True,
+    )
+    return False
+
+
+async def _deactivate_legacy_anketa_panel(
+    guild: discord.Guild, keep_message_id: int | None = None
+) -> None:
+    """Одноразово гасит старую отдельную панель анкеты после слияния.
+
+    Раньше анкета публиковалась своим сообщением и хранилась в anketa_state.json.
+    После перехода на единую панель старый файл больше не нужен: помечаем его
+    сообщение неактивным и удаляем файл, чтобы не осталось «висящей» панели.
+    """
+    try:
+        with open(LEGACY_ANKETA_STATE_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+
+    if isinstance(data, dict):
+        message_id = data.get("panel_message_id")
+        channel_id = data.get("panel_channel_id")
+        if message_id and channel_id and str(message_id) != str(keep_message_id):
+            channel = guild.get_channel(int(channel_id))
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    message = await channel.fetch_message(int(message_id))
+                    await mark_panel_inactive(message, None)
+                except discord.HTTPException:
+                    pass
+
+    try:
+        os.remove(LEGACY_ANKETA_STATE_PATH)
+    except OSError:
+        pass
+
+
 def _resolve_channel(
     guild: discord.Guild, interaction: discord.Interaction, channel_id: str | None
 ) -> discord.TextChannel | None:
@@ -563,23 +598,27 @@ def setup(bot: commands.Bot) -> None:
         if state["message_id"] and str(payload.message_id) == state["message_id"]:
             print(
                 f"[PANEL] Сообщение-панель {payload.message_id} удалено. "
-                "Выдача ролей по реакции не работает до /reactionroles_post."
+                "Выдача ролей по реакции не работает до /anketa_post."
             )
 
     @bot.event
     async def on_raw_message_edit(payload):
         state = load_state()
-        if not state["message_id"] or not state["roles"]:
+        if not state["message_id"]:
             return
         if str(payload.message_id) != state["message_id"]:
             return
         message, status = await _fetch_panel(bot, state)
         if status != "ok" or message is None:
             return
-        if panel_matches(message, state):
+        # Восстанавливаем, если поехал текст/поля или пропали кнопки анкеты.
+        if panel_matches(message, state) and message.components:
             return
         try:
-            await message.edit(embed=build_panel_embed(message.guild, state))
+            await message.edit(
+                embed=build_panel_embed(message.guild, state),
+                view=applications.PanelView(),
+            )
             print(
                 f"[PANEL] Панель {payload.message_id} отредактирована вручную, "
                 "восстановлена"
@@ -649,13 +688,13 @@ def setup(bot: commands.Bot) -> None:
 
         if role.id in _protected_role_ids():
             text += (
-                "\n⚠️ Роль защищена (входит в стартовый комплект `/startroles` "
+                "\n⚠️ Роль защищена (входит в стартовый комплект `/startroles_list` "
                 "или в справочник анкеты `/anketa_list`). Панель не будет снимать "
                 "её за отсутствие реакции."
             )
 
         if not state["message_id"] or status != "ok":
-            text += "\nℹ️ Панель не опубликована — выполните `/reactionroles_post`."
+            text += "\nℹ️ Панель не опубликована — выполните `/anketa_post`."
 
         await interaction.response.send_message(text, ephemeral=True)
 
@@ -712,7 +751,7 @@ def setup(bot: commands.Bot) -> None:
                     print(f"[PANEL] Ошибка снятия роли у {member.id}: {e}")
 
         message, status = await _fetch_panel(bot, state)
-        if status == "ok" and message is not None and state["roles"]:
+        if status == "ok" and message is not None:
             try:
                 await render_panel(message, state)
             except discord.HTTPException as e:
@@ -726,18 +765,21 @@ def setup(bot: commands.Bot) -> None:
 
         await interaction.response.send_message(text, ephemeral=True)
 
-    # ----------------- /REACTIONROLES_POST -----------------
+    # ----------------- /ANKETA_POST (единая панель) -----------------
     @bot.tree.command(
-        name="reactionroles_post", description="Создать или обновить панель выдачи ролей"
+        name="anketa_post",
+        description="Создать или обновить единую панель: анкета и выбор ролей",
     )
     @app_commands.describe(
         channel_id="Канал для панели (по умолчанию — текущий канал)",
         confirm="Подтвердить перенос панели в другой канал",
     )
-    async def post_panel(
-        interaction: discord.Interaction, channel_id: str | None = None, confirm: bool = False
+    async def anketa_post(
+        interaction: discord.Interaction,
+        channel_id: str | None = None,
+        confirm: bool = False,
     ) -> None:
-        if not await _check_moderator(interaction):
+        if not await _check_officer(interaction):
             return
 
         guild = interaction.guild
@@ -748,13 +790,6 @@ def setup(bot: commands.Bot) -> None:
             return
 
         state = load_state()
-
-        if not state["roles"]:
-            await interaction.response.send_message(
-                "❌ Маппинг пуст. Сначала добавьте роли через `/reactionroles_add`.",
-                ephemeral=True,
-            )
-            return
 
         channel = _resolve_channel(guild, interaction, channel_id)
         if channel is None:
@@ -776,7 +811,12 @@ def setup(bot: commands.Bot) -> None:
         # Это защищает от единственного разрушительного сценария: пересоздания
         # сообщения, при котором слетают все реакции и sync снимает роли у людей.
         if status == "ok" and existing is not None and existing.channel.id == channel.id:
-            await render_panel(existing, state)
+            await existing.edit(
+                embed=build_panel_embed(guild, state),
+                view=applications.PanelView(),
+            )
+            await ensure_reactions(existing, state)
+            await _deactivate_legacy_anketa_panel(guild, existing.id)
             await interaction.response.send_message(
                 f"✅ Панель обновлена на месте: {existing.jump_url}", ephemeral=True
             )
@@ -793,7 +833,10 @@ def setup(bot: commands.Bot) -> None:
             )
             return
 
-        new_message = await channel.send(embed=build_panel_embed(guild, state))
+        new_message = await channel.send(
+            embed=build_panel_embed(guild, state),
+            view=applications.PanelView(),
+        )
         state["message_id"] = str(new_message.id)
         state["channel_id"] = str(channel.id)
         save_state(state)
@@ -802,6 +845,8 @@ def setup(bot: commands.Bot) -> None:
 
         if existing is not None:
             await mark_panel_inactive(existing, new_message.jump_url)
+
+        await _deactivate_legacy_anketa_panel(guild, new_message.id)
 
         await interaction.response.send_message(
             f"✅ Панель опубликована: {new_message.jump_url}", ephemeral=True
@@ -835,8 +880,8 @@ def setup(bot: commands.Bot) -> None:
                     lines.append(f"• {key} → ⚠️ роль {role_id_str} не найдена")
                     continue
                 note = ""
-                if role.id in set(start_roles.load_roles()):
-                    note = " ⚠️ входит в начальный комплект `/startroles`"
+                if role.id in applications.start_role_ids():
+                    note = " ⚠️ входит в начальный комплект `/startroles_list`"
                 lines.append(f"• {key} → {role.mention}{note}")
 
         message, status = await _fetch_panel(bot, state)
@@ -845,17 +890,17 @@ def setup(bot: commands.Bot) -> None:
             if message.channel.id != interaction.channel_id:
                 lines.append(
                     f"⚠️ Панель в другом канале ({message.channel.mention}). "
-                    "Используйте `/reactionroles_post channel_id: …`."
+                    "Используйте `/anketa_post channel_id: …`."
                 )
         elif status == "broken":
             lines.append(
                 "\n⚠️ **Панель удалена.** Роли не трогаются. "
-                "Восстановить: `/reactionroles_post`."
+                "Восстановить: `/anketa_post`."
             )
         elif status == "error":
             lines.append("\n⚠️ Не удалось определить канал панели — проверьте конфиг.")
         else:
-            lines.append("\n**Панель:** не создана. Выполните `/reactionroles_post`.")
+            lines.append("\n**Панель:** не создана. Выполните `/anketa_post`.")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -916,7 +961,7 @@ def setup(bot: commands.Bot) -> None:
 
         # 4. Панель
         if not state["message_id"]:
-            lines.append("❌ **Панель:** не создана. Выполните `/reactionroles_post`")
+            lines.append("❌ **Панель:** не создана. Выполните `/anketa_post`")
         else:
             channel = (
                 guild.get_channel(int(state["channel_id"]))
@@ -947,7 +992,7 @@ def setup(bot: commands.Bot) -> None:
                 except discord.NotFound:
                     lines.append(
                         f"❌ **Сообщение {state['message_id']} удалено.** "
-                        "Восстановить: `/reactionroles_post`"
+                        "Восстановить: `/anketa_post`"
                     )
                 except discord.HTTPException as e:
                     lines.append(f"❌ **Не удалось загрузить сообщение:** {e}")
@@ -1002,7 +1047,7 @@ def setup(bot: commands.Bot) -> None:
         elif result == "broken":
             text = (
                 "⚠️ Сообщение-панель удалено — роли не трогались.\n"
-                "Восстановить: `/reactionroles_post`."
+                "Восстановить: `/anketa_post`."
             )
         else:
             text = "ℹ️ Нечего синхронизировать: панель не создана или маппинг пуст."
@@ -1116,6 +1161,6 @@ def setup(bot: commands.Bot) -> None:
             )
         else:
             lines.append("• Роли у участников оставлены (`revoke_roles: false`)")
-        lines.append("Создать заново: `/reactionroles_post`.")
+        lines.append("Создать заново: `/anketa_post`.")
 
         await interaction.edit_original_response(content="\n".join(lines))

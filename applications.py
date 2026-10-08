@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 import start_roles
@@ -28,7 +27,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-07-r14-sync-api-on-join-approve"
+VERSION = "2026-10-08-r15-merged-panel"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,9 +36,6 @@ OPTIONS_CACHE_PATH = os.getenv(
 )
 APPLICATIONS_PATH = os.getenv(
     "ANKETA_DATA_PATH", os.path.join("data", "applications.json")
-)
-STATE_PATH = os.getenv(
-    "ANKETA_STATE_PATH", os.path.join("data", "anketa_state.json")
 )
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -372,19 +368,6 @@ def save_applications(data: dict) -> None:
     _atomic_write_json(APPLICATIONS_PATH, data)
 
 
-def load_state() -> dict:
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def save_state(state: dict) -> None:
-    _atomic_write_json(STATE_PATH, state)
-
-
 # ============================================================================
 # СПРАВОЧНИК
 # ============================================================================
@@ -427,9 +410,14 @@ async def warmup() -> None:
     print(f"[ANKETA] Обновление справочника из таблицы: {'ok' if ok else 'ошибка'} — {msg}")
 
 
+def start_role_ids() -> set[int]:
+    """Роли начального комплекта, выдаваемые анкетой при вступлении."""
+    return set(start_roles.load_roles())
+
+
 def protected_role_ids() -> set[int]:
     """Роли, которые нельзя снимать панелью реакций (старт + анкета + гости)."""
-    ids: set[int] = set(start_roles.load_roles())
+    ids: set[int] = start_role_ids()
     ids |= set(GUEST_ROLE_IDS) | set(CLOSE_GUEST_ROLE_IDS)
     for items in get_options().values():
         for item in items:
@@ -1538,24 +1526,6 @@ async def _check_officer(interaction: discord.Interaction) -> bool:
     return False
 
 
-def _resolve_channel(
-    guild: discord.Guild, interaction: discord.Interaction, channel_id: str | None
-) -> discord.TextChannel | None:
-    if not channel_id or not str(channel_id).strip().isdigit():
-        channel = interaction.channel
-    else:
-        channel = guild.get_channel(int(str(channel_id).strip()))
-    return channel if isinstance(channel, discord.TextChannel) else None
-
-
-async def _fetch_panel(guild: discord.Guild, state: dict):
-    message_id = state.get("panel_message_id")
-    channel_id = state.get("panel_channel_id")
-    if not message_id or not channel_id:
-        return None
-    return await _fetch_message(guild, int(channel_id), int(message_id))
-
-
 def _diagnose_sync() -> list[str]:
     lines: list[str] = []
     path = _service_account_path()
@@ -1597,83 +1567,6 @@ def setup(bot: commands.Bot) -> None:
             bot.add_view(ApplicationView(app_id))
         except Exception as e:
             print(f"[ANKETA] Не удалось восстановить заявку {app_id}: {e}")
-
-    # ----------------- /ANKETA_POST -----------------
-    @bot.tree.command(
-        name="anketa_post", description="Опубликовать или обновить панель анкеты"
-    )
-    @app_commands.describe(
-        channel_id="Канал для панели (по умолчанию — текущий)",
-        confirm="Подтвердить перенос панели в другой канал",
-    )
-    async def anketa_post(
-        interaction: discord.Interaction,
-        channel_id: str | None = None,
-        confirm: bool = False,
-    ) -> None:
-        if not await _check_officer(interaction):
-            return
-
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "❌ Команда должна выполняться на сервере.", ephemeral=True
-            )
-            return
-
-        channel = _resolve_channel(guild, interaction, channel_id)
-        if channel is None:
-            await interaction.response.send_message(
-                "❌ Не удалось определить канал для панели.", ephemeral=True
-            )
-            return
-        if not channel.permissions_for(guild.me).send_messages:
-            await interaction.response.send_message(
-                f"❌ У бота нет права `Send Messages` в канале {channel.mention}.",
-                ephemeral=True,
-            )
-            return
-
-        state = load_state()
-        existing = await _fetch_panel(guild, state)
-
-        if existing is not None and existing.channel.id == channel.id:
-            await existing.edit(embed=build_panel_embed(), view=PanelView())
-            await interaction.response.send_message(
-                f"✅ Панель обновлена на месте: {existing.jump_url}", ephemeral=True
-            )
-            return
-
-        if existing is not None and not confirm:
-            await interaction.response.send_message(
-                f"⚠️ Панель уже опубликована в {existing.channel.mention} "
-                f"({existing.jump_url}).\nПеренос создаст новое сообщение. "
-                "Повторите с `confirm: true`.",
-                ephemeral=True,
-            )
-            return
-
-        message = await channel.send(embed=build_panel_embed(), view=PanelView())
-        save_state(
-            {"panel_message_id": message.id, "panel_channel_id": channel.id}
-        )
-
-        if existing is not None:
-            try:
-                await existing.edit(
-                    embed=discord.Embed(
-                        title="⚠️ Панель неактивна",
-                        description=f"Актуальная панель: {message.jump_url}",
-                        color=discord.Color.greyple(),
-                    ),
-                    view=None,
-                )
-            except discord.HTTPException:
-                pass
-
-        await interaction.response.send_message(
-            f"✅ Панель опубликована: {message.jump_url}", ephemeral=True
-        )
 
     # ----------------- /ANKETA_RELOAD -----------------
     @bot.tree.command(

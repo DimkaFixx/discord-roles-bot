@@ -120,7 +120,7 @@ def setup(bot: commands.Bot) -> None:
     @bot.tree.command(
         name="startroles_add", description="Добавить роль в начальный комплект"
     )
-    @app_commands.describe(role="Роль, которая будет выдаваться командой /startroles")
+    @app_commands.describe(role="Роль, которая будет выдаваться при вступлении")
     async def startroles_add(
         interaction: discord.Interaction, role: discord.Role
     ) -> None:

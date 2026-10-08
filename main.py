@@ -3,7 +3,6 @@ import logging
 from contextlib import asynccontextmanager
 import discord
 from discord.ext import commands
-from discord import app_commands
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 import uvicorn
@@ -11,7 +10,7 @@ import uvicorn
 import applications
 import reaction_roles
 import start_roles
-from config import API_SECRET_KEY, BOT_TOKEN, GUEST_ROLE_IDS, GUILD_ID, is_moderator
+from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID
 
 # Логи discord.py и наши в stdout/stderr — иначе ошибки интеракций не видны в логах
 discord.utils.setup_logging(level=logging.INFO)
@@ -27,7 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Панель выдачи ролей по реакциям: команды + обработчики событий
 reaction_roles.setup(bot)
 
-# Редактируемый начальный комплект ролей для /startroles
+# Редактируемый начальный комплект ролей (команды /startroles_*); выдача — анкетой
 start_roles.setup(bot)
 
 # Анкета вступления + гостевые заявки с модерацией офицерами
@@ -131,79 +130,6 @@ async def on_ready():
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("Pong! Бот и API работают.")
-
-# ----------------- СЛЭШ-КОМАНДА /STARTROLES -----------------
-@bot.tree.command(name="startroles", description="Выдать начальный комплект ролей участнику")
-@app_commands.describe(member="Участник, которому выдаем роли")
-async def grant_start_roles(interaction: discord.Interaction, member: discord.Member):
-    # 1. Проверяем роли модератора
-    if not is_moderator(interaction.user):
-        await interaction.response.send_message(
-            "❌ У вас нет прав для использования этой команды.", 
-            ephemeral=True
-        )
-        return
-
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("❌ Команда должна выполняться на сервере.", ephemeral=True)
-        return
-
-    # 2. Собираем роли для выдачи (список редактируется через /startroles_add)
-    role_ids = start_roles.load_roles()
-    if not role_ids:
-        await interaction.response.send_message(
-            "⚠️ Начальный комплект пуст. Наполните его через `/startroles_add`.",
-            ephemeral=True,
-        )
-        return
-
-    roles_to_add = []
-    for role_id in role_ids:
-        role = guild.get_role(role_id)
-        if role and role not in member.roles:
-            roles_to_add.append(role)
-
-    guest_roles = [
-        role
-        for role in (guild.get_role(rid) for rid in GUEST_ROLE_IDS)
-        if role is not None and role in member.roles
-    ]
-
-    if not roles_to_add and not guest_roles:
-        await interaction.response.send_message(
-            f"⚠️ У участника {member.mention} уже есть все начальные роли или роли не найдены на сервере.", 
-            ephemeral=True
-        )
-        return
-
-    # 3. Выдаем начальные роли и снимаем гостевую роль
-    try:
-        summary_lines = []
-        if roles_to_add:
-            await member.add_roles(*roles_to_add, reason=f"Выдача начальных ролей модератором {interaction.user}")
-            summary_lines.append(
-                "Выданы роли: " + " ".join(r.mention for r in roles_to_add)
-            )
-        if guest_roles:
-            await member.remove_roles(*guest_roles, reason=f"Снятие гостевой роли модератором {interaction.user}")
-            summary_lines.append(
-                "Снята гостевая роль: " + " ".join(r.mention for r in guest_roles)
-            )
-
-        await interaction.response.send_message(
-            f"✅ Участник {member.mention}:\n" + "\n".join(summary_lines)
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ Ошибка прав: Убедитесь, что роль бота находится ВЫШЕ выдаваемых ролей в настройках сервера.", 
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message(
-            f"❌ Ошибка при выдаче ролей: {str(e)}", 
-            ephemeral=True
-        )
 
 # ----------------- ЗАПУСК -----------------
 if __name__ == "__main__":
