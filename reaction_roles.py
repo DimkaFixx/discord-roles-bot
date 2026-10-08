@@ -19,7 +19,7 @@ LEGACY_ANKETA_STATE_PATH = os.getenv(
 
 # Маркер версии модуля. Печатается при старте и виден в /doctor.
 # Нужен, чтобы отличать «баг в коде» от «контейнер собран из старого образа».
-PANEL_VERSION = "2026-10-08-r6-merged-anketa-panel"
+PANEL_VERSION = "2026-10-08-r7-prune-reactions"
 
 # Пауза между изменениями ролей, чтобы не упереться в rate limit на больших серверах
 SYNC_DELAY = 0.5
@@ -180,8 +180,52 @@ async def ensure_reactions(message: discord.Message, state: dict) -> None:
             print(f"[PANEL] Не удалось поставить реакцию {key}: {e}")
 
 
+async def _clear_panel_reaction(
+    message: discord.Message, reaction: discord.Reaction
+) -> None:
+    """Снимает реакцию у всех: и у бота, и у людей.
+
+    `Reaction.clear()` требует Manage Messages. Если права нет — снимаем
+    хотя бы собственную реакцию бота, чтобы эмодзи не осталось на панели.
+    """
+    try:
+        await reaction.clear()
+        return
+    except discord.Forbidden:
+        pass
+    except discord.HTTPException as e:
+        print(f"[PANEL] Не удалось снять реакцию {reaction.emoji}: {e}")
+        return
+
+    me = message.guild.me if message.guild else None
+    if me is None:
+        return
+    try:
+        await message.remove_reaction(reaction.emoji, me)
+    except discord.HTTPException as e:
+        print(f"[PANEL] Не удалось снять реакцию бота {reaction.emoji}: {e}")
+
+
+async def prune_reactions(message: discord.Message, state: dict) -> set[str]:
+    """Снимает с панели реакции, которых больше нет в маппинге.
+
+    Нужно после `/reactionroles_remove`: `message.edit()` реакции не трогает,
+    поэтому без этого эмодзи оставалось бы на сообщении навсегда.
+    """
+    valid = set(state["roles"])
+    removed: set[str] = set()
+    for reaction in list(message.reactions):
+        key = emoji_key(reaction.emoji)
+        if key not in valid:
+            await _clear_panel_reaction(message, reaction)
+            removed.add(key)
+    if removed:
+        print(f"[PANEL] Сняты лишние реакции: {sorted(removed)}")
+    return removed
+
+
 async def render_panel(message: discord.Message, state: dict) -> None:
-    """Обновляет текст панели и досыпает недостающие реакции.
+    """Обновляет текст панели, досыпает недостающие и убирает лишние реакции.
 
     Реакции живут на сообщении, а message.edit() их не трогает —
     поэтому правка маппинга безопасна для уже выданных ролей. Панель
@@ -189,6 +233,7 @@ async def render_panel(message: discord.Message, state: dict) -> None:
     """
     await message.edit(embed=build_panel_embed(message.guild, state))
     await ensure_reactions(message, state)
+    await prune_reactions(message, state)
 
 
 def panel_matches(message: discord.Message, state: dict) -> bool:
@@ -472,6 +517,12 @@ async def sync_panel(bot) -> str:
 
     guild = message.guild
     managed = _managed_role_ids(state)
+
+    # Чистим панель: досыпаем недостающие и убираем лишние реакции
+    # (например, привязку удалили, пока бот был выключен).
+    await ensure_reactions(message, state)
+    await prune_reactions(message, state)
+
     keys_by_user = await _collect_emoji_keys(state, message)
     desired_by_user = {
         user_id: _desired_role_ids(state, keys) for user_id, keys in keys_by_user.items()
@@ -816,6 +867,7 @@ def setup(bot: commands.Bot) -> None:
                 view=applications.PanelView(),
             )
             await ensure_reactions(existing, state)
+            await prune_reactions(existing, state)
             await _deactivate_legacy_anketa_panel(guild, existing.id)
             await interaction.response.send_message(
                 f"✅ Панель обновлена на месте: {existing.jump_url}", ephemeral=True
@@ -842,6 +894,7 @@ def setup(bot: commands.Bot) -> None:
         save_state(state)
 
         await ensure_reactions(new_message, state)
+        await prune_reactions(new_message, state)
 
         if existing is not None:
             await mark_panel_inactive(existing, new_message.jump_url)
