@@ -57,6 +57,7 @@ APPLICATION_CHANNEL_ID = _parse_int_env("APPLICATION_CHANNEL_ID")
 OFFICER_ROLE_IDS = _parse_int_list(os.getenv("OFFICER_ROLE_IDS", ""))
 GUEST_ROLE_IDS = _parse_int_list(os.getenv("GUEST_ROLE_IDS", ""))
 CLOSE_GUEST_ROLE_IDS = _parse_int_list(os.getenv("CLOSE_GUEST_ROLE_IDS", ""))
+VACATION_ROLE_ID = _parse_int_env("VACATION_ROLE_ID")
 
 # Роль, которую пингуем при заявке на дополнительную роль (если не задана — пингуем модераторов)
 ONLY_MODER_DS_ID = _parse_int_env("ONLY_MODER_DS_ID")

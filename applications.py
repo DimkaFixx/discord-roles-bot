@@ -24,6 +24,7 @@ from config import (
     SPREADSHEET_ID,
     TIMEZONE_OPTIONS,
     TOKEN_SECRET,
+    VACATION_ROLE_ID,
     is_officer,
 )
 
@@ -622,8 +623,9 @@ class PanelView(discord.ui.View):
 class ExtraRolesView(discord.ui.View):
     """Постраничный выбор ролей в ephemeral-сообщении.
 
-    Показывает все роли сервера (кроме @everyone, managed и уже выданных
-    участнику) по 25 на страницу. Выбор накапливается между страницами.
+    Показывает роли сервера, которые бот может выдать: кроме @everyone,
+    managed, уже выданных участнику, стартовых/анкетных/гостевых ролей и
+    роли отпуска. По 25 на страницу. Выбор накапливается между страницами.
     """
 
     def __init__(
@@ -640,10 +642,17 @@ class ExtraRolesView(discord.ui.View):
         self.selected: set[str] = set()
         self.page = 0
         self.query: str = ""
+        protected = protected_role_ids()
+        me = guild.me
         self.all_roles: list[discord.Role] = [
             role
             for role in guild.roles
-            if not role.is_default() and not role.managed and role not in member.roles
+            if not role.is_default()
+            and not role.managed
+            and role not in member.roles
+            and role.id not in protected
+            and role.id != VACATION_ROLE_ID
+            and (me is None or me.top_role.position > role.position)
         ]
         self.all_roles.sort(key=lambda role: role.position, reverse=True)
         self.roles: list[discord.Role] = self.all_roles
