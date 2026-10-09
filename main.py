@@ -9,6 +9,7 @@ import uvicorn
 
 import applications
 import reaction_roles
+import role_overrides
 import start_roles
 from config import API_SECRET_KEY, BOT_TOKEN, GUILD_ID
 
@@ -28,6 +29,9 @@ reaction_roles.setup(bot)
 
 # Редактируемый начальный комплект ролей (команды /startroles_*); выдача — анкетой
 start_roles.setup(bot)
+
+# Переопределения списка «Дополнительная роль» (/roles_enable_*, /roles_disable_*, /roles_status_list)
+role_overrides.setup(bot)
 
 # Анкета вступления + гостевые заявки с модерацией офицерами
 applications.setup(bot)

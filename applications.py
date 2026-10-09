@@ -10,6 +10,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+import role_overrides
 import start_roles
 from config import (
     ALLOWED_MODERATOR_ROLE_IDS,
@@ -28,7 +29,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-08-r15-merged-panel"
+VERSION = "2026-10-09-r16-role-overrides"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -638,7 +639,9 @@ class ExtraRolesView(discord.ui.View):
 
     Показывает роли сервера, которые бот может выдать: кроме @everyone,
     managed, уже выданных участнику, стартовых/анкетных/гостевых ролей и
-    роли отпуска. По 25 на страницу. Выбор накапливается между страницами.
+    роли отпуска. Списки переопределений (role_overrides.json) правят это:
+    enable возвращает роли из protected/панели/отпуска, disable скрывает
+    роль из формы. По 25 на страницу. Выбор накапливается между страницами.
     """
 
     def __init__(
@@ -657,17 +660,29 @@ class ExtraRolesView(discord.ui.View):
         self.query: str = ""
         protected = protected_role_ids()
         panel = panel_role_ids()
+        enabled = role_overrides.enabled_role_ids()
+        disabled = role_overrides.disabled_role_ids()
         me = guild.me
+
+        def _include(role: discord.Role) -> bool:
+            # Базовые ограничения: роль должна быть управляемой ботом и ещё
+            # не выданной участнику. Их не переопределяют настройки.
+            if role.is_default() or role.managed or role in member.roles:
+                return False
+            if me is not None and me.top_role.position <= role.position:
+                return False
+            if role.id in disabled:
+                return False
+            if role.id in enabled:
+                return True
+            return (
+                role.id not in protected
+                and role.id not in panel
+                and role.id != VACATION_ROLE_ID
+            )
+
         self.all_roles: list[discord.Role] = [
-            role
-            for role in guild.roles
-            if not role.is_default()
-            and not role.managed
-            and role not in member.roles
-            and role.id not in protected
-            and role.id not in panel
-            and role.id != VACATION_ROLE_ID
-            and (me is None or me.top_role.position > role.position)
+            role for role in guild.roles if _include(role)
         ]
         self.all_roles.sort(key=lambda role: role.position, reverse=True)
         self.roles: list[discord.Role] = self.all_roles
