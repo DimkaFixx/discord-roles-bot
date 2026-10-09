@@ -428,6 +428,19 @@ def protected_role_ids() -> set[int]:
     return ids
 
 
+def panel_role_ids() -> set[int]:
+    """Роли, выдаваемые панелью реакций — их не показываем в заявке."""
+    try:
+        import reaction_roles
+    except Exception:
+        return set()
+    try:
+        state = reaction_roles.load_state()
+    except Exception:
+        return set()
+    return {int(v) for v in state.get("roles", {}).values()}
+
+
 # ============================================================================
 # РОЛИ
 # ============================================================================
@@ -643,6 +656,7 @@ class ExtraRolesView(discord.ui.View):
         self.page = 0
         self.query: str = ""
         protected = protected_role_ids()
+        panel = panel_role_ids()
         me = guild.me
         self.all_roles: list[discord.Role] = [
             role
@@ -651,6 +665,7 @@ class ExtraRolesView(discord.ui.View):
             and not role.managed
             and role not in member.roles
             and role.id not in protected
+            and role.id not in panel
             and role.id != VACATION_ROLE_ID
             and (me is None or me.top_role.position > role.position)
         ]
