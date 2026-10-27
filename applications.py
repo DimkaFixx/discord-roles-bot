@@ -29,7 +29,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-09-r16-role-overrides"
+VERSION = "2026-10-28-r17-anketa-flow"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -58,6 +58,9 @@ CUSTOM_EXTRA = "anketa:extra"
 # Постраничный выбор ролей для заявки «Дополнительная роль»
 EXTRA_PAGE_SIZE = 25
 EXTRA_MAX_ROLES = 10
+
+# Постраничный выбор специализации в анкете (лимит Discord на один Select)
+PICKER_PAGE_SIZE = 25
 
 # Системный API: вызывается после одобрения заявки на вступление (type_ == "member")
 SYNC_API_URL = os.getenv("SYNC_API_URL", "https://327.dimkafixx.ru/api/system/sync")
@@ -244,6 +247,7 @@ RESPONSE_HEADER_MAP = {
     "discord_id": "discord id",
     "status": "статус",
     "decided_by": "решение",
+    "confirm": "подтвержд",
 }
 
 DEFAULT_RESPONSE_HEADERS = [
@@ -258,6 +262,7 @@ DEFAULT_RESPONSE_HEADERS = [
     "(Не) являюсь приписником",
     "Статус",
     "Решение принял",
+    "Подтверждение вступления",
 ]
 
 
@@ -271,6 +276,10 @@ def _ensure_status_columns(ws, headers: list[str]) -> list[str]:
         col = len(headers) + 1
         ws.update_cell(1, col, "Решение принял")
         headers.append("Решение принял")
+    if not any("подтвержд" in h for h in lower):
+        col = len(headers) + 1
+        ws.update_cell(1, col, "Подтверждение вступления")
+        headers.append("Подтверждение вступления")
     return headers
 
 
@@ -291,6 +300,7 @@ def _value_for_header(header: str, record: dict, status: str, decided_by: str) -
         "discord_id": str(record.get("user_id", "")),
         "status": "Одобрено" if status == "approved" else "Отклонено",
         "decided_by": str(decided_by),
+        "confirm": answers.get("confirm", "") or "-",
     }
     for field, needle in RESPONSE_HEADER_MAP.items():
         if needle in hl:
@@ -590,11 +600,7 @@ class PanelView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
-            await interaction.response.send_message(
-                "Выберите часовой пояс, затем нажмите «Далее».",
-                view=TimezoneView(interaction.user.id),
-                ephemeral=True,
-            )
+            await interaction.response.send_modal(AnketaModal())
         except Exception as e:
             print(f"[ANKETA] Ошибка открытия анкеты: {e!r}")
             if not interaction.response.is_done():
@@ -945,10 +951,232 @@ def _build_select(
     )
 
 
+class SpecSearchModal(discord.ui.Modal, title="Поиск специализации"):
+    def __init__(self, view: "SpecPickerView") -> None:
+        super().__init__()
+        self._view = view
+        self.query = discord.ui.TextInput(
+            custom_id="anketa:spec-search-query",
+            placeholder="Часть названия (пусто — показать все)",
+            required=False,
+            max_length=100,
+        )
+        self.add_item(
+            discord.ui.Label(text="Поиск по названию", component=self.query)
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self._view.user_id:
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        self._view.query = str(self.query.value or "").strip()
+        self._view._apply_filter()
+        await interaction.response.edit_message(
+            content=self._view.hint(), view=self._view
+        )
+
+
+class SpecPickerView(discord.ui.View):
+    """Постраничный выбор специализации: по 25 пунктов на страницу."""
+
+    def __init__(
+        self,
+        answers: dict,
+        user_id: int,
+        origin: discord.Interaction | None = None,
+    ) -> None:
+        super().__init__(timeout=600)
+        self.answers = dict(answers)
+        self.user_id = user_id
+        # Интеракция отправки модалки: её original response — это сообщение шага
+        self._origin = origin
+        self.query = ""
+        self.selected: str | None = None
+        self.all_items = list(get_options().get("spec", []))
+        self.items = list(self.all_items)
+        self.page = 0
+        self.max_pages = 1
+        self.select: discord.ui.Select | None = None
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        query = self.query.strip().lower()
+        if query:
+            self.items = [
+                item
+                for item in self.all_items
+                if query in str(item.get("label", "")).lower()
+            ]
+        else:
+            self.items = list(self.all_items)
+        self.max_pages = max(
+            1, (len(self.items) + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE
+        )
+        self.page = 0
+        self._rebuild()
+
+    def _page_items(self) -> list:
+        start = self.page * PICKER_PAGE_SIZE
+        return self.items[start : start + PICKER_PAGE_SIZE]
+
+    def hint(self) -> str:
+        text = (
+            "**Шаг 2/3 · Специализация**\n"
+            "Выберите специализацию и нажмите «Далее» или «Пропустить».\n"
+        )
+        if self.query:
+            text += f"**Поиск:** «{self.query}» · найдено {len(self.items)}\n"
+        text += f"Страница {self.page + 1}/{self.max_pages}"
+        if self.selected:
+            text += f"\n**Выбрано:** {self.selected}"
+        return text
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        options = [
+            discord.SelectOption(
+                label=(str(item.get("label", "")) or "—")[:100],
+                value=(str(item.get("label", "")) or "—")[:100],
+                default=str(item.get("label", "")) == self.selected,
+            )
+            for item in self._page_items()
+        ]
+        if options:
+            select = discord.ui.Select(
+                custom_id="anketa:spec-select",
+                placeholder=f"Специализации (страница {self.page + 1}/{self.max_pages})",
+                options=options,
+                min_values=1,
+                max_values=1,
+            )
+            select.callback = self._on_select
+            self.select = select
+            self.add_item(select)
+        else:
+            self.select = None
+
+        search = discord.ui.Button(
+            label="Поиск",
+            style=discord.ButtonStyle.primary,
+            custom_id="anketa:spec-search",
+        )
+        prev = discord.ui.Button(
+            label="◀",
+            style=discord.ButtonStyle.secondary,
+            custom_id="anketa:spec-prev",
+            disabled=self.page <= 0,
+        )
+        nxt = discord.ui.Button(
+            label="▶",
+            style=discord.ButtonStyle.secondary,
+            custom_id="anketa:spec-next-page",
+            disabled=self.page >= self.max_pages - 1,
+        )
+        skip = discord.ui.Button(
+            label="Пропустить",
+            style=discord.ButtonStyle.secondary,
+            custom_id="anketa:spec-skip",
+        )
+        done = discord.ui.Button(
+            label="Далее",
+            style=discord.ButtonStyle.success,
+            custom_id="anketa:spec-done",
+        )
+        search.callback = self._on_search
+        prev.callback = self._on_prev
+        nxt.callback = self._on_next_page
+        skip.callback = self._on_skip
+        done.callback = self._on_done
+        self.add_item(search)
+        self.add_item(prev)
+        self.add_item(nxt)
+        self.add_item(skip)
+        self.add_item(done)
+
+    def _is_owner(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def _on_select(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        self.selected = (
+            self.select.values[0] if self.select is not None and self.select.values else None
+        )
+        await interaction.response.defer()
+
+    async def _on_page(self, interaction: discord.Interaction, delta: int):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        self.page = max(0, min(self.max_pages - 1, self.page + delta))
+        self._rebuild()
+        await interaction.response.edit_message(content=self.hint(), view=self)
+
+    async def _on_prev(self, interaction: discord.Interaction):
+        await self._on_page(interaction, -1)
+
+    async def _on_next_page(self, interaction: discord.Interaction):
+        await self._on_page(interaction, 1)
+
+    async def _on_search(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(SpecSearchModal(self))
+
+    async def _finish(self, interaction: discord.Interaction, spec: str):
+        self.answers["spec"] = spec
+        await interaction.response.edit_message(
+            content=(
+                "**Шаг 3/3 · Часовой пояс**\n"
+                "Выберите часовой пояс и нажмите «Далее»."
+            ),
+            view=TimezoneView(self.user_id, self.answers, self._origin),
+        )
+
+    async def _on_skip(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        await self._finish(interaction, "-")
+
+    async def _on_done(self, interaction: discord.Interaction):
+        if not self._is_owner(interaction):
+            await interaction.response.send_message(
+                "Это не ваша анкета.", ephemeral=True
+            )
+            return
+        if not self.selected:
+            await interaction.response.send_message(
+                "Сначала выберите специализацию или нажмите «Пропустить».",
+                ephemeral=True,
+            )
+            return
+        await self._finish(interaction, self.selected)
+
+
 class TimezoneView(discord.ui.View):
-    def __init__(self, user_id: int) -> None:
+    def __init__(
+        self,
+        user_id: int,
+        answers: dict,
+        origin: discord.Interaction | None = None,
+    ) -> None:
         super().__init__(timeout=300)
         self.user_id = user_id
+        self.answers = dict(answers)
+        self._origin = origin
         self.tz: str | None = None
 
         async def callback(interaction: discord.Interaction):
@@ -986,24 +1214,29 @@ class TimezoneView(discord.ui.View):
                 "Сначала выберите часовой пояс.", ephemeral=True
             )
             return
+        self.answers["tz"] = self.tz
         try:
-            await interaction.response.send_modal(AnketaModal(self.tz, interaction))
+            ok = await _create_application(interaction, "member", self.answers)
         except Exception as e:
-            print(f"[ANKETA] Ошибка открытия модалки: {e!r}")
+            print(f"[ANKETA] Ошибка отправки анкеты: {e!r}")
             if not interaction.response.is_done():
                 await interaction.response.send_message(
                     f"❌ Ошибка: {e}", ephemeral=True
                 )
+            return
+        if ok and self._origin is not None:
+            try:
+                await self._origin.delete_original_response()
+            except Exception as e:
+                print(
+                    "[ANKETA] Не удалось удалить сообщение шага анкеты: "
+                    f"{e!r}"
+                )
 
 
 class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
-    def __init__(
-        self, tz: str, origin: discord.Interaction | None = None
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.tz = tz
-        # Интеракция кнопки «Далее» — чтобы после отправки удалить её ephemeral-сообщение
-        self._origin = origin
         options = get_options()
         self.callsign = discord.ui.TextInput(
             custom_id="anketa:callsign", required=True, max_length=100
@@ -1014,13 +1247,6 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
         self.rank = _build_select(
             "anketa:rank", "Выберите звание", options.get("rank", []), required=True
         )
-        self.spec = _build_select(
-            "anketa:spec",
-            "Специализация (если есть)",
-            options.get("spec", []),
-            required=False,
-            ensure_dash=True,
-        )
         self.att = _build_select(
             "anketa:att",
             "Приписка",
@@ -1028,17 +1254,21 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
             required=False,
             ensure_dash=True,
         )
+        self.confirm = discord.ui.Checkbox(custom_id="anketa:confirm")
 
         self.add_item(discord.ui.Label(text="Позывной", component=self.callsign))
         self.add_item(discord.ui.Label(text="Номер", component=self.number))
         if self.rank is not None:
             self.add_item(discord.ui.Label(text="Звание", component=self.rank))
-        if self.spec is not None:
-            self.add_item(
-                discord.ui.Label(text="Специализация (если есть)", component=self.spec)
-            )
         if self.att is not None:
             self.add_item(discord.ui.Label(text="Приписка", component=self.att))
+        self.add_item(
+            discord.ui.Label(
+                text="Подтверждение вступления",
+                description="Отметьте, чтобы подтвердить вступление в батальон",
+                component=self.confirm,
+            )
+        )
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -1052,11 +1282,11 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
                     "Звание не выбрано — начните анкету заново.", ephemeral=True
                 )
                 return
-            spec = (
-                self.spec.values[0]
-                if self.spec is not None and self.spec.values
-                else ""
-            )
+            if not self.confirm.value:
+                await interaction.response.send_message(
+                    "❌ Подтвердите вступление, чтобы продолжить.", ephemeral=True
+                )
+                return
             att = (
                 self.att.values[0]
                 if self.att is not None and self.att.values
@@ -1066,9 +1296,9 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
                 "callsign": str(self.callsign.value).strip(),
                 "number": str(self.number.value).strip(),
                 "rank": rank,
-                "spec": spec or "-",
+                "spec": "-",
                 "att": att or "-",
-                "tz": self.tz,
+                "confirm": "Да",
             }
         except Exception as e:
             print(f"[ANKETA] Ошибка чтения анкеты: {e!r}")
@@ -1079,15 +1309,13 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
             except discord.HTTPException:
                 pass
             return
-        ok = await _create_application(interaction, "member", answers)
-        if ok and self._origin is not None:
-            try:
-                await self._origin.delete_original_response()
-            except Exception as e:
-                print(
-                    "[ANKETA] Не удалось удалить сообщение выбора часового пояса: "
-                    f"{e!r}"
-                )
+
+        await interaction.response.send_message(
+            "**Шаг 2/3 · Специализация**\n"
+            "Выберите специализацию и нажмите «Далее» или «Пропустить».",
+            view=SpecPickerView(answers, interaction.user.id, interaction),
+            ephemeral=True,
+        )
 
 
 # ============================================================================
@@ -1124,6 +1352,11 @@ def build_application_embed(
         )
         embed.add_field(name="Приписка", value=answers.get("att") or "—", inline=True)
         embed.add_field(name="Часовой пояс", value=answers.get("tz") or "—", inline=True)
+        embed.add_field(
+            name="Подтверждение вступления",
+            value=answers.get("confirm") or "—",
+            inline=True,
+        )
 
     elif type_ == "extra":
         roles = [r for r in (answers.get("roles") or []) if str(r).isdigit()]
@@ -1365,6 +1598,11 @@ async def _notify_user(
         )
         embed.add_field(name="Приписка", value=answers.get("att") or "—", inline=True)
         embed.add_field(name="Часовой пояс", value=answers.get("tz") or "—", inline=True)
+        embed.add_field(
+            name="Подтверждение вступления",
+            value=answers.get("confirm") or "—",
+            inline=True,
+        )
 
     elif type_ == "extra":
         roles = [r for r in (answers.get("roles") or []) if str(r).isdigit()]
