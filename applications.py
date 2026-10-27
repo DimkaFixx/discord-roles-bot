@@ -29,7 +29,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-28-r17-anketa-flow"
+VERSION = "2026-10-28-r18-anketa-confirm-text"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -283,6 +283,12 @@ def _ensure_status_columns(ws, headers: list[str]) -> list[str]:
     return headers
 
 
+def _sheet_safe_text(value: str) -> str:
+    """Не даёт пользовательскому тексту стать формулой в Google Sheets."""
+    text = str(value or "")
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
 def _value_for_header(header: str, record: dict, status: str, decided_by: str) -> str:
     hl = header.lower()
     answers = record.get("answers", {}) or {}
@@ -300,7 +306,7 @@ def _value_for_header(header: str, record: dict, status: str, decided_by: str) -
         "discord_id": str(record.get("user_id", "")),
         "status": "Одобрено" if status == "approved" else "Отклонено",
         "decided_by": str(decided_by),
-        "confirm": answers.get("confirm", "") or "-",
+        "confirm": _sheet_safe_text(answers.get("confirm", "") or "-"),
     }
     for field, needle in RESPONSE_HEADER_MAP.items():
         if needle in hl:
@@ -1254,7 +1260,13 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
             required=False,
             ensure_dash=True,
         )
-        self.confirm = discord.ui.Checkbox(custom_id="anketa:confirm")
+        self.confirm = discord.ui.TextInput(
+            custom_id="anketa:confirm",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+            placeholder="Вставьте ссылку или напишите подтверждение",
+        )
 
         self.add_item(discord.ui.Label(text="Позывной", component=self.callsign))
         self.add_item(discord.ui.Label(text="Номер", component=self.number))
@@ -1265,7 +1277,7 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
         self.add_item(
             discord.ui.Label(
                 text="Подтверждение вступления",
-                description="Отметьте, чтобы подтвердить вступление в батальон",
+                description="Вставьте ссылку или напишите подтверждение",
                 component=self.confirm,
             )
         )
@@ -1282,9 +1294,11 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
                     "Звание не выбрано — начните анкету заново.", ephemeral=True
                 )
                 return
-            if not self.confirm.value:
+            confirm = str(self.confirm.value).strip()
+            if not confirm:
                 await interaction.response.send_message(
-                    "❌ Подтвердите вступление, чтобы продолжить.", ephemeral=True
+                    "❌ Напишите или вставьте подтверждение вступления, чтобы продолжить.",
+                    ephemeral=True,
                 )
                 return
             att = (
@@ -1298,7 +1312,7 @@ class AnketaModal(discord.ui.Modal, title="Анкета вступления"):
                 "rank": rank,
                 "spec": "-",
                 "att": att or "-",
-                "confirm": "Да",
+                "confirm": confirm,
             }
         except Exception as e:
             print(f"[ANKETA] Ошибка чтения анкеты: {e!r}")
