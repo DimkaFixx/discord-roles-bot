@@ -17,8 +17,11 @@ from config import (
     APPLICATION_CHANNEL_ID,
     CLOSE_GUEST_ROLE_IDS,
     GUEST_ROLE_IDS,
+    LIST_TO_SORT,
     OFFICER_ROLE_IDS,
     ONLY_MODER_DS_ID,
+    ROWSTOSORT_FROM,
+    ROWSTOSORT_TO,
     SERVICE_ACCOUNT_FOR_SPREADSHEET_FILENAME,
     SHEET_REFERENCE,
     SHEET_RESPONSES,
@@ -29,7 +32,7 @@ from config import (
     is_officer,
 )
 
-VERSION = "2026-10-28-r18-anketa-confirm-text"
+VERSION = "2026-10-28-r19-list-sort"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -351,6 +354,37 @@ def _append_application_sync(record: dict, status: str, decided_by: str) -> None
             value_input_option="USER_ENTERED",
         )
         print(f"[ANKETA] Заявка записана в строку {target_row}")
+
+
+def _sort_list_sheet_sync() -> None:
+    """Сортирует лист состава после внесения нового бойца и обновляет рамки."""
+    with _sheet_write_lock:
+        import gspread
+
+        sh = _open_spreadsheet_sync()
+        ws = sh.worksheet(LIST_TO_SORT)
+        rows_count = ws.row_count
+        cols_count = ws.col_count
+        sort_range = f"{ROWSTOSORT_FROM}3:{ROWSTOSORT_TO}{rows_count}"
+        ws.sort((1, "asc"), range=sort_range)
+
+        full_range = f"A1:{gspread.utils.rowcol_to_a1(rows_count, cols_count)}"
+        border_style = {
+            "style": "SOLID",
+            "color": {"red": 1.0, "green": 1.0, "blue": 1.0},
+        }
+        ws.format(
+            full_range,
+            {
+                "borders": {
+                    "top": border_style,
+                    "bottom": border_style,
+                    "left": border_style,
+                    "right": border_style,
+                }
+            },
+        )
+        print(f"[ANKETA] Лист «{LIST_TO_SORT}» отсортирован")
 
 
 # ============================================================================
@@ -1762,6 +1796,13 @@ async def process_decision(
                 except Exception as e:
                     notes.append(f"⚠️ Не удалось записать в таблицу: {e}")
                     print(f"[ANKETA] Ошибка записи в таблицу: {e}")
+                else:
+                    try:
+                        await asyncio.to_thread(_sort_list_sheet_sync)
+                        notes.append(f"Лист «{LIST_TO_SORT}» отсортирован.")
+                    except Exception as e:
+                        notes.append(f"⚠️ Не удалось отсортировать лист: {e}")
+                        print(f"[ANKETA] Ошибка сортировки листа: {e}")
 
         record["reason"] = reason
 

@@ -45,6 +45,11 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 SHEET_REFERENCE = os.getenv("SHEET_REFERENCE", "Справочник")
 SHEET_RESPONSES = os.getenv("SHEET_RESPONSES", "Форма +Бойцы")
 
+# Лист состава: сортируется после одобрения заявки на вступление
+LIST_TO_SORT = os.getenv("LIST_TO_SORT", "Состав").strip() or "Состав"
+ROWSTOSORT_FROM = os.getenv("ROWSTOSORT_FROM", "A").strip() or "A"
+ROWSTOSORT_TO = os.getenv("ROWSTOSORT_TO", "AB").strip() or "AB"
+
 # Имя файла ключа сервисного аккаунта (может быть относительным — резолвится от корня проекта)
 SERVICE_ACCOUNT_FOR_SPREADSHEET_FILENAME = os.getenv(
     "SERVICE_ACCOUNT_FOR_SPREADSHEET_FILENAME", ""
